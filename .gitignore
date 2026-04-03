@@ -213,3 +213,4 @@ data
 roi_grid
 src/specscout/scripts
 notebooks
+slurm/logs
