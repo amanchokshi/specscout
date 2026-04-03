@@ -1,0 +1,87 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "specscout"
+version = "0.1.0"
+description = "A pipeline for ingesting, preprocessing, and detecting transient events in ALBATROS low-frequency radio data"
+keywords = ["radio astronomy", "transient", "solar", "arctic", "telescope", "ALBATROS"]
+authors = [{ name = "Aman Chokshi", email = "aman.chokshi@mcgill.ca" }]
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.13"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+
+dependencies = [
+    "cmasher>=1.9.2",
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.4",
+    "pandas>=3.0.2",
+    "pbio>=0.0.4",
+    "scikit-learn>=1.8.0",
+    "scipy>=1.17.1",
+    "tqdm>=4.67.3",
+    "zarr>=3.1.6",
+]
+
+[project.urls]
+Homepage = "https://github.com/amanchokshi/specscout"
+Documentation = "https://github.com/amanchokshi/specscout"
+Repository = "https://github.com/amanchokshi/specscout"
+Issues = "https://github.com/amanchokshi/specscout/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/specscout"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/specscout/**",
+  "pyproject.toml",
+  "README.md",
+  "LICENSE",
+]
+
+[project.scripts]
+specscout = "specscout.cli:main"
+
+[tool.uv]
+package = true
+
+[dependency-groups]
+dev = [
+    "ipympl>=0.10.0",
+    "ipython>=9.12.0",
+    "jupyter>=1.1.1",
+    "jupyterlab>=4.5.6",
+    "poethepoet>=0.42.1",
+    "ruff>=0.15.9",
+    "twine>=6.2.0",
+]
+
+
+[tool.poe.tasks]
+fmt = "ruff format"
+lint = "ruff check --fix"
+all = ["fmt", "lint"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 128
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "A",  # built-in shadowing
+    "E",  # style
+    "F",  # pyflakes
+    "I",  # import sorting
+    "N",  # naming
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["specscout"]
