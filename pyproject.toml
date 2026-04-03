@@ -19,14 +19,14 @@ classifiers = [
 
 dependencies = [
     "cmasher>=1.9.2",
-    "matplotlib<=3.10.8",
-    "numpy<=2.4.2",
-    "pandas<=3.0.0",
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.2",
+    "pandas>=3.0.0",
     "pbio>=0.0.4",
     "scikit-learn>=1.8.0",
-    "scipy>=1.17.1",
+    "scipy>=1.17.0",
     "tqdm>=4.67.3",
-    "zarr<=3.1.5",
+    "zarr>=3.1.5",
 ]
 
 [project.urls]
