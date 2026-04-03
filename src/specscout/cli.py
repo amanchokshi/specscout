@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import zarr
+
 from .ingest import (
     IngestConfig,
     infer_available_utc_bounds,
@@ -65,6 +67,40 @@ def ingest_cmd(args: argparse.Namespace) -> None:
     print(f"Wrote {out}")
 
 
+def zarrmeta_cmd(args: argparse.Namespace) -> None:
+    path = args.path
+
+    if not path.exists():
+        raise FileNotFoundError(f"{path} does not exist")
+
+    z = zarr.open_group(path, mode="r")
+    attrs = dict(z.attrs)
+
+    print(f"\nZarr: {path}\n")
+
+    keys = [
+        "station",
+        "startutc",
+        "stoputc",
+        "created_utc",
+        "nt",
+        "nchan",
+        "dt_seconds",
+        "f0_mhz",
+        "df_mhz",
+        "source_root",
+    ]
+
+    for k in keys:
+        v = attrs.get(k, "<missing>")
+        print(f"{k:<14}: {v}")
+
+    if args.all:
+        print("\nAll attributes:")
+        for k, v in attrs.items():
+            print(f"{k:<14}: {v}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="specscout",
@@ -112,6 +148,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional output .zarr path.",
     )
     ingest.set_defaults(func=ingest_cmd)
+
+    # zarrmeta
+    zmeta = subparsers.add_parser(
+        "zarrmeta",
+        help="Print metadata from a specscout Zarr store.",
+    )
+    zmeta.add_argument(
+        "path",
+        type=Path,
+        help="Path to .zarr directory",
+    )
+    zmeta.add_argument(
+        "--all",
+        action="store_true",
+        help="Print all attributes (not just key fields).",
+    )
+    zmeta.set_defaults(func=zarrmeta_cmd)
 
     return parser
 
