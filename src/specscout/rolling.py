@@ -533,10 +533,10 @@ class RollingPCARunner:
 
                     keep_idx_arr = np.asarray(keep_idx, dtype=int)
                     ctx_frames_fit = ctx_frames[keep_idx_arr]
-                    ctx_metas_fit = [ctx_metas[i] for i in keep_idx]
+                    # ctx_metas_fit = [ctx_metas[i] for i in keep_idx]
                 else:
                     ctx_frames_fit = ctx_frames
-                    ctx_metas_fit = ctx_metas
+                    # ctx_metas_fit = ctx_metas
 
                 # Quiet selection
                 quiet_scores = qs.scores(ctx_frames_fit)
