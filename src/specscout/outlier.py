@@ -741,39 +741,3 @@ class RollingPCABackground:
             min_finite_frac=float(min_finite_frac),
             normalize_missing=bool(normalize_missing),
         )
-
-
-# -----------------------------------------------------------------------------
-# Small rolling helper (pure numpy, no I/O)
-# -----------------------------------------------------------------------------
-
-
-def rolling_windows(
-    indices: Iterable[int],
-    *,
-    window: int,
-    stride: int,
-) -> Iterable[list[int]]:
-    """
-    Yield overlapping windows of indices.
-
-    Parameters
-    ----------
-    indices
-        Iterable of integer indices (e.g. range(len(ds))).
-    window
-        Window length (number of indices).
-    stride
-        Step between window starts.
-
-    Yields
-    ------
-    win
-        List of indices for each window.
-    """
-    idx = [int(i) for i in indices]
-    n = len(idx)
-    if window <= 0 or stride <= 0:
-        raise ValueError("window and stride must be positive.")
-    for s in range(0, max(0, n - window + 1), stride):
-        yield idx[s : s + window]
