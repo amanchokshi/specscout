@@ -314,6 +314,18 @@ class PreprocessPipeline:
         s = self._steps[-1].out_space
         return s if s is not None else self._input_space
 
+    def with_metadata(self, **metadata: Any) -> "PreprocessPipeline":
+        """
+        Return a new pipeline with updated pipeline-level metadata.
+        """
+        md = dict(self._metadata)
+        md.update(metadata)
+        return PreprocessPipeline(
+            self._steps,
+            metadata=md,
+            input_space=self._input_space,
+        )
+
     def add_step(
         self,
         name: str,
@@ -420,31 +432,84 @@ class PreprocessPipeline:
 # -----------------------------------------------------------------------------
 
 
-def step_safe_db(**kwargs) -> PipelineStep:
+def step_safe_db(
+    *,
+    floor: float = 1e-12,
+    dtype: np.dtype = np.float32,
+    name: str = "safe_db",
+    in_space: DataSpace = "linear",
+    out_space: DataSpace = "db",
+) -> PipelineStep:
+    """
+    Build a PipelineStep that converts linear-valued frames to dB via `safe_db`.
+    """
+    t = make_safe_db_transform(floor=floor, dtype=dtype)
+    cfg = {
+        "floor": float(floor),
+        "dtype": str(np.dtype(dtype)),
+    }
     return PipelineStep(
-        name="safe_db",
-        transform=make_safe_db_transform(**kwargs),
-        config={"floor": kwargs.get("floor", 1e-12)},
-        in_space="linear",
-        out_space="db",
+        name=name,
+        transform=t,
+        config=cfg,
+        in_space=in_space,
+        out_space=out_space,
     )
 
 
-def step_stokes_i(**kwargs) -> PipelineStep:
+def step_stokes_i(
+    *,
+    dtype: np.dtype = np.float32,
+    name: str = "stokes_i",
+    in_space: DataSpace = "linear",
+    out_space: DataSpace = "linear",
+) -> PipelineStep:
+    """
+    Build a PipelineStep that converts (XX, YY) into Stokes I.
+    """
+    t = make_stokes_i_transform(dtype=dtype)
+    cfg = {
+        "dtype": str(np.dtype(dtype)),
+        "channel_order_in": ["XX", "YY"],
+        "channel_order_out": ["I"],
+        "convention": "I = 0.5 * (XX + YY)",
+    }
     return PipelineStep(
-        name="stokes_i",
-        transform=make_stokes_i_transform(**kwargs),
-        config={},
-        in_space="linear",
-        out_space="linear",
+        name=name,
+        transform=t,
+        config=cfg,
+        in_space=in_space,
+        out_space=out_space,
     )
 
 
-def step_stokes_iquv(**kwargs) -> PipelineStep:
+def step_stokes_iquv(
+    *,
+    dtype: np.dtype = np.float32,
+    name: str = "stokes_iquv",
+    in_space: DataSpace = "linear",
+    out_space: DataSpace = "linear",
+) -> PipelineStep:
+    """
+    Build a PipelineStep that converts (XX, YY, XY_mag, XY_phase) into
+    full Stokes (I, Q, U, V).
+    """
+    t = make_stokes_iquv_transform(dtype=dtype)
+    cfg = {
+        "dtype": str(np.dtype(dtype)),
+        "channel_order_in": ["XX", "YY", "XY_mag", "XY_phase"],
+        "channel_order_out": ["I", "Q", "U", "V"],
+        "convention": {
+            "I": "0.5 * (XX + YY)",
+            "Q": "0.5 * (XX - YY)",
+            "U": "real(XY_mag * exp(1j * XY_phase))",
+            "V": "imag(XY_mag * exp(1j * XY_phase))",
+        },
+    }
     return PipelineStep(
-        name="stokes_iquv",
-        transform=make_stokes_iquv_transform(**kwargs),
-        config={},
-        in_space="linear",
-        out_space="linear",
+        name=name,
+        transform=t,
+        config=cfg,
+        in_space=in_space,
+        out_space=out_space,
     )
