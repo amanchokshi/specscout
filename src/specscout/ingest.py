@@ -13,7 +13,6 @@ rest of the package (patch extraction, preprocessing, visualization, ML).
 
 Notes
 -----
-- This ingest step does **not** perform bandpass subtraction or whitening.
 - This implementation targets ALBATROS direct spectra which are expected to
   have exactly 2048 frequency channels. Files with unexpected shapes/channels
   are skipped and the corresponding region remains NaN in the preallocated cube.
