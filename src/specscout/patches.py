@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -200,106 +200,6 @@ def read_patch(
         t_start_idx=t_start_idx,
         start_time_utc=time_axis.start_time_utc(t_start_idx),
     )
-
-
-def iter_patch_starts(
-    nt_total: int,
-    *,
-    window_n: int,
-    step_n: int,
-    t_start_idx: int = 0,
-    t_stop_idx: Optional[int] = None,
-) -> Iterator[int]:
-    """
-    Yield start indices for a sliding window over [t_start_idx, t_stop_idx).
-
-    Parameters
-    ----------
-    nt_total
-        Total number of time samples in the cube.
-    window_n
-        Window length in samples.
-    step_n
-        Step size between consecutive windows in samples.
-    t_start_idx
-        First start index to consider.
-    t_stop_idx
-        Stop index for start positions (exclusive). If None, uses `nt_total`.
-
-    Yields
-    ------
-    int
-        Start indices such that [t, t+window_n) lies within the cube.
-    """
-    if window_n <= 0:
-        raise ValueError("window_n must be positive.")
-    if step_n <= 0:
-        raise ValueError("step_n must be positive.")
-    if t_start_idx < 0:
-        raise ValueError("t_start_idx must be >= 0.")
-
-    if t_stop_idx is None:
-        t_stop_idx = nt_total
-
-    last_start = min(t_stop_idx, nt_total) - window_n
-    if last_start < t_start_idx:
-        return
-
-    t = t_start_idx
-    while t <= last_start:
-        yield t
-        t += step_n
-
-
-def iter_patches(
-    zarr_path: str,
-    spec: PatchSpec,
-    *,
-    hours: Optional[float] = None,
-    t_start_idx: int = 0,
-    transform: Optional[Callable[[Patch], Patch]] = None,
-) -> Iterator[Patch]:
-    """
-    Iterate over patches from a Zarr store.
-
-    Parameters
-    ----------
-    zarr_path
-        Path to the specscout ``.zarr`` store.
-    spec
-        Patch specification.
-    hours
-        If provided, limits iteration to the first `hours` from `t_start_idx`.
-    t_start_idx
-        First patch start index.
-    transform
-        Optional function applied to each Patch (e.g., preprocessing). The callable
-        must accept and return a `Patch`.
-
-    Yields
-    ------
-    Patch
-        Patch objects containing data and metadata.
-    """
-    cube, _attrs, time_axis = open_cube(zarr_path)
-
-    nt_total = cube.shape[0]
-    t_stop_idx = None
-    if hours is not None:
-        n = int(round(hours * 3600.0 / time_axis.dt_s))
-        t_stop_idx = min(nt_total, t_start_idx + n)
-
-    for ts in iter_patch_starts(
-        nt_total,
-        window_n=spec.window_n,
-        step_n=spec.step_n,
-        t_start_idx=t_start_idx,
-        t_stop_idx=t_stop_idx,
-    ):
-        p = read_patch(cube, time_axis, spec, t_start_idx=ts)
-        if transform is not None:
-            p = transform(p)
-        yield p
 
 
 def _coerce_utc_timestamp(t: str | datetime | pd.Timestamp) -> pd.Timestamp:
