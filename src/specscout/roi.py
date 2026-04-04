@@ -1,30 +1,21 @@
 """
-ROI search pipeline for specscout seasonal Zarr products.
+ROI detection and search workflow utilities for specscout.
 
-This module runs a production-style transient search over a user-specified
-analysis window using:
+This module defines:
 
-- a configurable detection product (currently Stokes I in the default pipe)
-- rolling quiet-PCA background modeling
-- configurable quiet-frame selection
-- configurable residual scoring
-- robust sigma thresholding to define ROIs
+- the ROI data model
+- robust thresholding and ROI grouping from frame-level scores
+- the main workflow for running rolling quiet-PCA search over a
+  station-season Zarr product
 
-Outputs are written to disk in a simple, inspectable format:
+The search workflow is configurable in terms of:
+- detection product / preprocessing pipeline
+- quiet-frame selection metric
+- residual scoring metric
+- ROI thresholding and merging parameters
 
-- scores.pkl
-- rois.pkl
-- config.json
-- scores_with_rois_*.png
-- rois/roi_XXXX_*.png
-
-Design notes
-------------
-- The input Zarr is assumed to contain the full available data for a station/season.
-- The requested analysis window may exceed the extant data bounds; the underlying
-  dataset / rolling framework is expected to handle missing data as NaNs.
-- Detection is performed on Stokes I derived from channels (0, 1) by default.
-- ROI plots are generated for all detected ROIs.
+Plotting helpers live in `specscout.viz`. CLI-level defaults such as the
+standard Stokes-I detection configuration should live in `specscout.cli`.
 """
 
 from __future__ import annotations
@@ -33,16 +24,18 @@ import json
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import zarr
 
 from .dataset import SpecscoutDataset
 from .outlier import QuietSelector, RollingPCABackground
-from .preprocess import PreprocessPipeline, step_safe_db, step_stokes_i
+from .preprocess import PreprocessPipeline
 from .rolling import RollingPCARunner, padded_utc_range
+from .viz import plot_roi_event, plot_scores_with_rois
 
 
 @dataclass(frozen=True)
@@ -53,15 +46,15 @@ class ROI:
     Parameters
     ----------
     start
-        Inclusive ROI start time.
+        Inclusive ROI start time after padding / merging.
     stop
-        Inclusive ROI stop time.
+        Inclusive ROI stop time after padding / merging.
     peak_score
-        Maximum frame score within the unpadded, above-threshold segment.
+        Maximum frame score within the original above-threshold run(s).
     sum_score
-        Sum of frame scores within the unpadded, above-threshold segment.
+        Sum of frame scores within the original above-threshold run(s).
     n_frames
-        Number of above-threshold frames contributing to the ROI before padding/merge.
+        Number of above-threshold frames contributing before padding / merge.
     """
 
     start: pd.Timestamp
@@ -117,7 +110,7 @@ def robust_sigma_threshold(scores: np.ndarray, *, nsig: float = 5.0) -> float:
     Parameters
     ----------
     scores
-        1D array of scores. NaNs/Infs are ignored.
+        1D array of scores. NaNs and infs are ignored.
     nsig
         Number of robust sigma above the median.
 
@@ -153,13 +146,13 @@ def find_rois_from_scores(
     """
     Detect ROIs from a frame-level score time series.
 
-    A frame is active if its score is finite and exceeds a robust sigma threshold.
+    A frame is active if its score is finite and exceeds a robust threshold.
     Contiguous active runs are converted into ROIs, then padded and merged.
 
     Parameters
     ----------
     df_scores
-        DataFrame containing at least columns ``time_col`` and ``score_col``.
+        DataFrame containing at least columns `time_col` and `score_col`.
     nsig
         Robust sigma multiplier used in thresholding.
     pad
@@ -221,6 +214,7 @@ def find_rois_from_scores(
 
     raw_rois.sort(key=lambda r: r.start)
     merged: list[ROI] = [raw_rois[0]]
+
     for r in raw_rois[1:]:
         prev = merged[-1]
         gap = r.start - prev.stop
@@ -240,7 +234,7 @@ def find_rois_from_scores(
 
 def rois_to_dataframe(rois: list[ROI]) -> pd.DataFrame:
     """
-    Convert ROI list to a DataFrame.
+    Convert a list of ROI objects to a DataFrame.
     """
     if not rois:
         return pd.DataFrame(columns=["start", "stop", "peak_score", "sum_score", "n_frames"])
@@ -267,7 +261,7 @@ def _sanitize_tag(text: str) -> str:
     """
     Convert a short label to a filename-safe tag.
     """
-    out = []
+    out: list[str] = []
     for ch in text:
         if ch.isalnum() or ch in {"-", "_"}:
             out.append(ch)
@@ -307,35 +301,6 @@ def _metric_label(kwargs: dict[str, Any]) -> str:
     return method
 
 
-def _default_quiet_selector_kwargs(
-    *,
-    quiet_fraction: float,
-    freq_mask: np.ndarray,
-) -> dict[str, Any]:
-    """
-    Default quiet-selector configuration for ROI search.
-    """
-    return {
-        "method": "p99",
-        "quiet_fraction": quiet_fraction,
-        "freq_mask": freq_mask,
-    }
-
-
-def _default_score_kwargs(
-    *,
-    min_finite_frac: float,
-) -> dict[str, Any]:
-    """
-    Default residual-scoring configuration for ROI search.
-    """
-    return {
-        "method": "p99",
-        "positive_only": True,
-        "min_finite_frac": min_finite_frac,
-    }
-
-
 def run_roi_search(
     zarr_path: str | Path,
     *,
@@ -343,25 +308,29 @@ def run_roi_search(
     analysis_start_utc: str,
     analysis_stop_utc: str,
     out_dir: str | Path,
+    detect_chans: int | tuple[int, ...] = (0, 1),
+    detect_pipe: PreprocessPipeline | None,
+    plot_chans: int | tuple[int, ...] | None = None,
+    plot_pipe: PreprocessPipeline | None = None,
     window_seconds: float = 20 * 60,
     step_seconds: float = 5 * 60,
     context_hours: float = 24.0,
     stride_hours: float = 1.0,
     score_hours: float = 1.0,
     gap_hours: float = 0.0,
-    quiet_fraction: float = 0.3,
-    n_quiet: Optional[int] = None,
+    n_quiet: int | None = None,
     k_fit: int = 128,
     k_pca: int = 16,
-    min_finite_frac: float = 0.7,
     nsig: float = 3.0,
     pad_minutes: float = 5.0,
     merge_gap_minutes: float = 20.0,
     rfi_mask_start: int = 116,
     rfi_mask_stop: int = 384,
     random_state: int = 42,
-    quiet_selector_kwargs: Optional[dict[str, Any]] = None,
-    score_kwargs: Optional[dict[str, Any]] = None,
+    quiet_selector_kwargs: dict[str, Any],
+    score_kwargs: dict[str, Any],
+    plot_pad_minutes: float = 5.0,
+    save_plots: bool = True,
 ) -> ROISearchResult:
     """
     Run a complete ROI search over a station-season Zarr product.
@@ -378,6 +347,14 @@ def run_roi_search(
         Requested analysis stop time in ``YYYYmmdd_HHMMSS``.
     out_dir
         Output directory for run products.
+    detect_chans
+        Channel selection used to build the detection dataset.
+    detect_pipe
+        Preprocessing pipeline used for detection. Must not be None.
+    plot_chans
+        Channel selection used for ROI plotting. Defaults to `detect_chans`.
+    plot_pipe
+        Preprocessing pipeline used for ROI plotting. Defaults to `detect_pipe`.
     window_seconds
         Frame duration for dataset extraction.
     step_seconds
@@ -390,49 +367,51 @@ def run_roi_search(
         Width of scored chunk per step.
     gap_hours
         Optional donut gap around the scored interval when fitting PCA.
-    quiet_fraction
-        Default fraction of context frames used as the quiet PCA training set.
-        This is used only if not overridden in ``quiet_selector_kwargs``.
     n_quiet
-        Optional fixed number of quiet frames. If provided, overrides
-        `quiet_fraction` within the rolling runner.
+        Optional fixed number of quiet frames.
     k_fit
         Number of PCA modes fit in the quiet background model.
     k_pca
         Number of PCA modes used in reconstruction during scoring.
-    min_finite_frac
-        Default minimum finite fraction required for a frame to receive a
-        score. This is used only if not overridden in ``score_kwargs``.
     nsig
         Robust sigma threshold multiplier for ROI detection.
     pad_minutes
         Time padding applied to each ROI boundary.
     merge_gap_minutes
-        Merge ROIs separated by less than or equal to this gap.
+        Merge ROIs separated by <= this gap.
     rfi_mask_start, rfi_mask_stop
         Frequency channel range to mask out during PCA and scoring.
     random_state
         Random seed used in randomized SVD.
     quiet_selector_kwargs
-        Optional override dictionary passed to ``QuietSelector``. This enables
-        selection metrics such as ``p99``, ``l1``, ``l2``, ``lp``, etc.
-        The dataset-specific ``freq_mask`` is always overwritten internally to
-        ensure consistency.
+        Fully formed kwargs passed to `QuietSelector`. The effective `freq_mask`
+        is overwritten internally to ensure consistency with the detection
+        dataset.
     score_kwargs
-        Optional override dictionary passed through to the rolling scoring
-        machinery. This enables scoring metrics such as ``p99``, ``l1``,
-        ``l2``, ``lp``, ``topk_sum``, etc.
+        Fully formed kwargs passed to rolling scoring.
+    plot_pad_minutes
+        Extra context on either side of each ROI in ROI quicklook plots.
+    save_plots
+        If True, write summary and ROI quicklook plots.
 
     Returns
     -------
     ROISearchResult
         Paths and counts describing the completed run.
     """
+    if detect_pipe is None:
+        raise ValueError("detect_pipe must be provided.")
+
     zarr_path = Path(zarr_path)
     out_dir = Path(out_dir)
     roi_plot_dir = out_dir / "rois"
     out_dir.mkdir(parents=True, exist_ok=True)
     roi_plot_dir.mkdir(parents=True, exist_ok=True)
+
+    if plot_chans is None:
+        plot_chans = detect_chans
+    if plot_pipe is None:
+        plot_pipe = detect_pipe
 
     ds_start_utc, ds_stop_utc = padded_utc_range(
         analysis_start_utc=analysis_start_utc,
@@ -445,32 +424,25 @@ def run_roi_search(
     zarr_startutc = zarr_attrs.get("startutc")
     zarr_stoputc = zarr_attrs.get("stoputc")
 
-    pipe_i = (
-        PreprocessPipeline(input_space="linear")
-        .with_metadata(
-            zarr_path=str(zarr_path),
-            station=station,
-            notes="Stokes I + safe_db",
-        )
-        .add(step_stokes_i())
-        .add(step_safe_db(name="safe_db"))
-    )
-
     ds = SpecscoutDataset(
         zarr_path,
         start_utc=ds_start_utc,
         stop_utc=ds_stop_utc,
         window_seconds=window_seconds,
         step_seconds=step_seconds,
-        chans=(0, 1),
-        pipe=pipe_i,
+        chans=detect_chans,
+        pipe=detect_pipe,
         return_meta=True,
     )
 
     example_x, _ = ds[0]
     example_x = np.asarray(example_x)
     if example_x.ndim != 2:
-        raise ValueError(f"Expected Stokes I dataset frames with shape (T, F); got {example_x.shape}")
+        raise ValueError(
+            "Expected detection dataset frames with shape (T, F); "
+            f"got {example_x.shape}. Detection pipe should usually reduce "
+            "the selected channels to a 2D product."
+        )
 
     _, nfreq = example_x.shape
     rfi_mask = np.ones((nfreq,), dtype=bool)
@@ -479,20 +451,10 @@ def run_roi_search(
     if me > ms:
         rfi_mask[ms:me] = False
 
-    quiet_selector_kwargs_final = _default_quiet_selector_kwargs(
-        quiet_fraction=quiet_fraction,
-        freq_mask=rfi_mask,
-    )
-    if quiet_selector_kwargs is not None:
-        quiet_selector_kwargs_final.update(quiet_selector_kwargs)
+    quiet_selector_kwargs_final = dict(quiet_selector_kwargs)
     quiet_selector_kwargs_final["freq_mask"] = rfi_mask
 
-    score_kwargs_final = _default_score_kwargs(
-        min_finite_frac=min_finite_frac,
-    )
-    if score_kwargs is not None:
-        score_kwargs_final.update(score_kwargs)
-    score_kwargs_final.setdefault("min_finite_frac", min_finite_frac)
+    score_kwargs_final = dict(score_kwargs)
 
     quiet_label = _sanitize_tag(_metric_label(quiet_selector_kwargs_final))
     score_label = _sanitize_tag(_metric_label(score_kwargs_final))
@@ -536,7 +498,15 @@ def run_roi_search(
             scores.append(float(score))
 
     df_scores = (
-        pd.DataFrame({"time": times, "frame_idx": frame_idx, "score": scores}).sort_values("time").reset_index(drop=True)
+        pd.DataFrame(
+            {
+                "time": times,
+                "frame_idx": frame_idx,
+                "score": scores,
+            }
+        )
+        .sort_values("time")
+        .reset_index(drop=True)
     )
 
     threshold, rois = find_rois_from_scores(
@@ -556,7 +526,8 @@ def run_roi_search(
         "requested_processing_stop_utc": ds_stop_utc,
         "zarr_startutc": zarr_startutc,
         "zarr_stoputc": zarr_stoputc,
-        "product": "stokes_i",
+        "detect_chans": list(detect_chans) if not isinstance(detect_chans, int) else [detect_chans],
+        "plot_chans": list(plot_chans) if not isinstance(plot_chans, int) else [plot_chans],
         "window_seconds": window_seconds,
         "step_seconds": step_seconds,
         "context_hours": context_hours,
@@ -564,12 +535,10 @@ def run_roi_search(
         "score_hours": score_hours,
         "gap_hours": gap_hours,
         "quiet_selector_kwargs": {k: v for k, v in quiet_selector_kwargs_final.items() if k != "freq_mask"},
-        "quiet_fraction": quiet_fraction,
-        "n_quiet": n_quiet,
         "score_kwargs": score_kwargs_final,
+        "n_quiet": n_quiet,
         "k_fit": k_fit,
         "k_pca": k_pca,
-        "min_finite_frac": min_finite_frac,
         "nsig": nsig,
         "pad_minutes": pad_minutes,
         "merge_gap_minutes": merge_gap_minutes,
@@ -578,8 +547,12 @@ def run_roi_search(
         "threshold": float(threshold) if np.isfinite(threshold) else None,
         "quiet_label": quiet_label,
         "score_label": score_label,
+        "save_plots": bool(save_plots),
+        "plot_pad_minutes": float(plot_pad_minutes),
         "n_scores": int(len(df_scores)),
         "n_rois": int(len(df_rois)),
+        "detect_pipe": detect_pipe.to_dict(),
+        "plot_pipe": plot_pipe.to_dict() if plot_pipe is not None else None,
     }
 
     scores_path = out_dir / "scores.pkl"
@@ -591,38 +564,37 @@ def run_roi_search(
     df_rois.to_pickle(rois_path)
     config_path.write_text(json.dumps(config, indent=2) + "\n")
 
-    fig, _ax = plot_scores_with_rois(
-        df_scores,
-        rois,
-        threshold=threshold,
-        title=(f"{station}: Stokes I ROI search (quiet={quiet_label}, score={score_label})"),
-    )
-    fig.savefig(summary_plot_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
-    for i, roi in enumerate(rois):
-        plot_pipe = PreprocessPipeline(input_space="linear").add(step_stokes_i()).add(step_safe_db(name="safe_db"))
-
-        fig, axs = plot_roi_event(
-            station=station,
-            roi=roi,
-            df_scores=df_scores,
-            zarr_path=zarr_path,
-            chans=(0, 1),
-            pipe=plot_pipe,
-            plot_pad_minutes=5.0,
+    if save_plots:
+        fig, _ax = plot_scores_with_rois(
+            df_scores,
+            rois,
             threshold=threshold,
-            quiet_label=quiet_label,
-            score_label=score_label,
+            title=(f"{station}: ROI search (quiet={quiet_label}, score={score_label})"),
         )
-
-        roi_tag = _utc_tag(roi.start)
-        fig.savefig(
-            roi_plot_dir / f"roi_{i:04d}_{roi_tag}_q-{quiet_label}_s-{score_label}.png",
-            dpi=144,
-            bbox_inches="tight",
-        )
+        fig.savefig(summary_plot_path, dpi=200, bbox_inches="tight")
         plt.close(fig)
+
+        for i, roi in enumerate(rois):
+            fig, _axs = plot_roi_event(
+                station=station,
+                roi=roi,
+                df_scores=df_scores,
+                zarr_path=zarr_path,
+                chans=plot_chans,
+                pipe=plot_pipe,
+                plot_pad_minutes=plot_pad_minutes,
+                threshold=threshold,
+                quiet_label=quiet_label,
+                score_label=score_label,
+            )
+
+            roi_tag = _utc_tag(roi.start)
+            fig.savefig(
+                roi_plot_dir / f"roi_{i:04d}_{roi_tag}_q-{quiet_label}_s-{score_label}.png",
+                dpi=144,
+                bbox_inches="tight",
+            )
+            plt.close(fig)
 
     return ROISearchResult(
         out_dir=out_dir,
