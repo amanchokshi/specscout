@@ -44,9 +44,12 @@ from typing import Callable, Optional, Sequence, Tuple, Union
 
 import cmasher as cmr
 import ipywidgets as widgets
+import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 from matplotlib.animation import FuncAnimation
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 from .core import (
     CHAN_LABELS,
@@ -56,8 +59,259 @@ from .core import (
     plan_frames,
 )
 from .dataset import SpecscoutDataset
-from .patches import PatchSpec, open_cube, read_patch
+from .patches import PatchSpec, open_cube, read_patch, read_time_range
 from .preprocess import PreprocessPipeline
+from .roi import ROI
+
+
+def plot_scores_with_rois(
+    df_scores: pd.DataFrame,
+    rois: list[ROI],
+    *,
+    threshold: Optional[float] = None,
+    time_col: str = "time",
+    score_col: str = "score",
+    title: Optional[str] = None,
+) -> tuple[plt.Figure, plt.Axes]:
+    """
+    Plot frame-level scores with ROI overlays.
+
+    Parameters
+    ----------
+    df_scores
+        DataFrame containing time and score columns.
+    rois
+        List of detected ROIs.
+    threshold
+        Optional threshold line to draw.
+    time_col
+        Name of timestamp column.
+    score_col
+        Name of score column.
+    title
+        Optional plot title.
+
+    Returns
+    -------
+    fig, ax
+        Matplotlib figure and axis.
+    """
+    df = df_scores[[time_col, score_col]].copy()
+    df[time_col] = pd.to_datetime(df[time_col], utc=True)
+    df = df.sort_values(time_col)
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(df[time_col], df[score_col], lw=0.7)
+    ax.set_xlabel("UTC time")
+    ax.set_ylabel("Outlier score")
+    ax.grid(ls=":", alpha=0.4)
+
+    if title is not None:
+        ax.set_title(title)
+
+    if threshold is not None and np.isfinite(threshold):
+        ax.axhline(threshold, ls="--", lw=1.0)
+
+    for roi in rois:
+        ax.axvspan(roi.start, roi.stop, alpha=0.2)
+
+    fig.tight_layout()
+    return fig, ax
+
+
+def plot_roi_event(
+    station: str,
+    roi: ROI,
+    df_scores: pd.DataFrame,
+    zarr_path: str | Path,
+    *,
+    chans: int | tuple[int, ...] | list[int],
+    pipe: PreprocessPipeline | None = None,
+    plot_pad_minutes: float = 5.0,
+    threshold: float | None = None,
+    time_col: str = "time",
+    score_col: str = "score",
+    quiet_label: str | None = None,
+    score_label: str | None = None,
+    cmap=cmr.pride,
+) -> tuple[plt.Figure, np.ndarray]:
+    """
+    Plot one ROI as a score panel plus a contiguous time-frequency waterfall.
+
+    This function reads the lower panel directly from the underlying Zarr cube
+    over the plotting interval, optionally applying a preprocessing pipeline.
+
+    Parameters
+    ----------
+    station
+        Station name used in panel annotation.
+    roi
+        ROI to plot. `roi.start` and `roi.stop` are assumed to already reflect
+        the final padded/merged ROI bounds from ROI detection.
+    df_scores
+        DataFrame containing at least `time_col` and `score_col`.
+    zarr_path
+        Path to the source Zarr store.
+    chans
+        Channel selection passed to `read_time_range(...)`.
+    pipe
+        Optional preprocessing pipeline applied after reading the contiguous
+        time range from Zarr.
+    plot_pad_minutes
+        Extra plotting context on either side of the ROI. This affects only the
+        displayed time span, not the ROI definition itself.
+    threshold
+        Optional score threshold drawn as a dotted horizontal line.
+    time_col
+        Name of score timestamp column in `df_scores`.
+    score_col
+        Name of score column in `df_scores`.
+    quiet_label
+        Short label for the quiet-selector method/config.
+    score_label
+        Short label for the scoring method/config.
+    cmap
+        Colormap used for the waterfall.
+
+    Returns
+    -------
+    fig, axs
+        Matplotlib figure and axes array.
+    """
+    df = df_scores.copy()
+    df[time_col] = pd.to_datetime(df[time_col], utc=True)
+
+    roi_start = pd.to_datetime(roi.start, utc=True)
+    roi_stop = pd.to_datetime(roi.stop, utc=True)
+
+    plot_pad = pd.Timedelta(minutes=float(plot_pad_minutes))
+    t_plot_min = roi_start - plot_pad
+    t_plot_max = roi_stop + plot_pad
+
+    mask_plot = (df[time_col] >= t_plot_min) & (df[time_col] <= t_plot_max)
+    df_plot = df.loc[mask_plot].sort_values(time_col)
+
+    fig, axs = plt.subplots(
+        2,
+        1,
+        figsize=(12, 6.5),
+        sharex=True,
+        gridspec_kw=dict(height_ratios=[1, 3]),
+    )
+    ax0, ax1 = axs
+
+    ax0.plot(df_plot[time_col], df_plot[score_col], lw=0.9)
+    ax0.axvspan(roi_start, roi_stop, alpha=0.20)
+
+    if threshold is not None and np.isfinite(threshold):
+        ax0.axhline(threshold, ls=":", lw=1.2)
+
+    ax0.set_ylabel("Score")
+    ax0.grid(ls=":", alpha=0.4)
+    ax0.set_xlim(t_plot_min, t_plot_max)
+    ax0.tick_params(axis="x", labelbottom=False)
+
+    roi_start_str = roi_start.round("1s").strftime("%Y-%m-%d %H:%M:%S UTC")
+    roi_stop_str = roi_stop.round("1s").strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    if quiet_label is not None or score_label is not None:
+        qs_label = f"quiet={quiet_label or 'unknown'}, score={score_label or 'unknown'}\n"
+    else:
+        qs_label = ""
+
+    label_lines = [
+        f"{roi_start_str} \u2192 {roi_stop_str}",
+        (f"peak={roi.peak_score:.3g}, sum={roi.sum_score:.3g}, n_frames={roi.n_frames}"),
+        f"{qs_label}{station}",
+    ]
+
+    ax0.text(
+        0.01,
+        0.95,
+        "\n".join(label_lines),
+        transform=ax0.transAxes,
+        ha="left",
+        va="top",
+    )
+
+    data_tf, times, _meta = read_time_range(
+        zarr_path,
+        start_utc=t_plot_min,
+        stop_utc=t_plot_max,
+        chans=chans,
+        pipe=pipe,
+    )
+
+    if data_tf.size == 0 or len(times) == 0:
+        ax1.text(0.5, 0.5, "No data in plotting window", ha="center", va="center")
+        ax1.set_axis_off()
+        fig.tight_layout()
+        return fig, axs
+
+    data_tf = np.asarray(data_tf)
+    if data_tf.ndim != 2:
+        raise ValueError(f"Expected plotted data with shape (T, F) after pipe application, got {data_tf.shape}.")
+
+    nt, nfreq = data_tf.shape
+    if nt < 2:
+        ax1.text(
+            0.5,
+            0.5,
+            "Insufficient samples in plotting window",
+            ha="center",
+            va="center",
+        )
+        ax1.set_axis_off()
+        fig.tight_layout()
+        return fig, axs
+
+    times = pd.to_datetime(times, utc=True)
+    t_num = mdates.date2num(times.to_pydatetime())
+    dt_days = np.median(np.diff(t_num))
+
+    x_edges = np.concatenate(
+        [
+            [t_num[0] - 0.5 * dt_days],
+            0.5 * (t_num[:-1] + t_num[1:]),
+            [t_num[-1] + 0.5 * dt_days],
+        ]
+    )
+    y_edges = np.arange(nfreq + 1) * (125.0 / 2048)
+
+    mesh = ax1.pcolormesh(
+        x_edges,
+        y_edges,
+        data_tf.T,
+        shading="auto",
+        cmap=cmap,
+    )
+
+    ax1.axvspan(roi_start, roi_stop, alpha=0.10)
+    ax1.set_yticks(np.arange(0, 150, 25))
+    ax1.set_ylabel("Frequency [MHz]")
+    ax1.set_xlabel("UTC time")
+    ax1.set_xlim(t_plot_min, t_plot_max)
+
+    divider = make_axes_locatable(ax1)
+    cax = divider.append_axes("top", size="7%", pad=0.05)
+    cbar = fig.colorbar(mesh, cax=cax, orientation="horizontal")
+    cbar.ax.xaxis.set_ticks_position("bottom")
+    cbar.ax.xaxis.set_label_position("bottom")
+    cbar.ax.tick_params(
+        axis="x",
+        direction="in",
+        pad=-11,
+        color="whitesmoke",
+        labelcolor="whitesmoke",
+    )
+
+    locator = mdates.AutoDateLocator()
+    formatter = mdates.ConciseDateFormatter(locator)
+    ax1.xaxis.set_major_locator(locator)
+    ax1.xaxis.set_major_formatter(formatter)
+
+    fig.tight_layout()
+    return fig, axs
 
 
 @dataclass(frozen=True)
