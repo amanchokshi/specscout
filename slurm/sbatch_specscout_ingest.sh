@@ -3,7 +3,7 @@
 #SBATCH --output=logs/ingest-%j.out
 #SBATCH --error=logs/ingest-%j.err
 #SBATCH --ntasks-per-node=192
-#SBATCH --time=3:00:00
+#SBATCH --time=1:00:00
 #SBATCH --nodes=1
 
 set -euo pipefail
@@ -32,5 +32,5 @@ echo "OUT_ZARR : $OUT_ZARR"
 
 specscout ingest "$DATA_DIR" \
     --station "$STATION" \
-    --batch-size 512 \
+    --batch-size 256 \
     --out-zarr "$OUT_ZARR"
