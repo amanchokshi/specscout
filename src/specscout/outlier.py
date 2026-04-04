@@ -1,58 +1,45 @@
 """
-Outlier detection utilities for specscout time–frequency frames.
+Outlier detection utilities for specscout time-frequency frames.
 
-This module provides two building blocks for large-scale, streaming analysis:
+This module provides two closely related building blocks for large-scale frame
+analysis:
 
-1) QuietSelector
-   Computes a per-frame "quietness" score (using only non-flagged channels)
-   and selects a quiet subset of frames for background modeling.
+1. `QuietSelector`
+   Computes a per-frame quietness score and selects a quiet subset of frames for
+   background modeling.
 
-2) RollingPCABackground
-   Fits a PCA background model on quiet frames (optionally within a rolling
-   context managed outside this module) and scores outliers using residuals.
-   Outlier scoring can be restricted to positive residuals (brighter-than-model).
+2. `RollingPCABackground`
+   Fits a PCA background model on quiet frames and scores candidate outliers
+   using residuals in the same feature space.
 
-Key design principles
----------------------
-- Work in a stable space (typically `safe_db`) via a PreprocessPipeline upstream.
-- Avoid bias from RFI-contaminated channels during quiet selection by masking.
-- Fit the background model on "quiet" frames only.
-- Outlier scoring can be based on positive residuals (bright events).
+Design principles
+-----------------
+- Work in a stable upstream transform space (typically `safe_db`).
+- Use a consistent feature representation: masked frames flattened to `(N, D)`.
+- Use the same metric vocabulary for both quiet-frame ranking and outlier
+  scoring.
+- Allow missing values to be handled explicitly and intentionally.
 
-Masking / RFI handling
-----------------------
-Most entry points accept an optional boolean frequency mask `freq_mask` of shape (F,).
-Convention:
-- True  => channel is "good" (kept)
-- False => channel is masked/ignored
+Masking convention
+------------------
+Most entry points accept an optional boolean frequency mask `freq_mask` of
+shape `(F,)`:
 
-- Quiet selection ALWAYS uses only unmasked channels.
-- PCA fitting and residual scoring can also ignore masked channels (recommended for
-  robust detection).
+- `True`  => keep the channel
+- `False` => mask / ignore the channel
 
-Metrics: unified MetricMethod
------------------------------
-Both QuietSelector and RollingPCABackground use the same metric core.
+The mask is applied along the frequency axis before flattening.
 
-The core operates on a canonical representation:
-- a feature matrix X of shape (N, D), where each row is a flattened frame (optionally
-  masked in frequency beforehand), OR a residual matrix R of the same shape.
+Metric vocabulary
+-----------------
+Both `QuietSelector` and `RollingPCABackground` use the same metric core via
+`compute_metric()`.
 
-QuietSelector:
-- computes X from raw frames, then scores using a chosen MetricMethod.
-- "quiet" = smaller scores (ascending).
-
-RollingPCABackground:
-- computes residuals R in feature space (N, D),
-- optionally clips to positive residuals,
-- scores using the same MetricMethod.
-- "outlier" = larger scores (descending).
-
-Dependencies
-------------
-- NumPy is required.
-- If scikit-learn is available, randomized SVD is used by default for efficiency.
-  Otherwise falls back to np.linalg.svd.
+Supported methods:
+- percentile aliases: `"p99"`, `"p995"`, `"p999"`
+- generic percentile: `"percentile"` (uses `q`)
+- tail / threshold metrics: `"topk_sum"`, `"excess_mass"`
+- norm metrics: `"l1"`, `"l2"`, `"lp"`
 
 Typical usage
 -------------
@@ -63,41 +50,44 @@ Build a dataset that returns frames already transformed into `safe_db`:
 
 Select quiet frames and fit a background PCA:
 
-    qs = QuietSelector(method="p99", quiet_fraction=0.7, freq_mask=rfi_mask)
-    bg = RollingPCABackground(k=256, center=True, freq_mask=rfi_mask)
+    qs = QuietSelector(method="p99", quiet_fraction=0.3, freq_mask=rfi_mask)
+    bg = RollingPCABackground(k=128, center=True, freq_mask=rfi_mask)
 
     frames, metas = ds.to_numpy_batch(...)
     quiet_idx = qs.select_quiet(frames)
     bg.fit(frames[quiet_idx])
 
-Score outliers on residuals (bright-only):
+Score outliers using residuals:
 
-    scores = bg.score(frames, method="topk_sum", topk=2048, positive_only=True)
-    outlier_idx = np.argsort(scores)[::-1]
+    scores = bg.score(
+        frames,
+        k_pca=16,
+        metric_kwargs={
+            "method": "topk_sum",
+            "topk": 2048,
+            "positive_only": True,
+            "min_finite_frac": 0.7,
+        },
+    )
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 import numpy as np
 from sklearn.utils.extmath import randomized_svd
 
 Array = np.ndarray
 
-# A single unified metric vocabulary for both "quietness" and "outlier score".
 MetricMethod = Literal[
-    # percentile aliases (no params required)
     "p99",
     "p995",
     "p999",
-    # generic percentile (uses q)
     "percentile",
-    # strong-tail mass
     "topk_sum",
     "excess_mass",
-    # norms
     "lp",
     "l1",
     "l2",
@@ -105,19 +95,28 @@ MetricMethod = Literal[
 
 
 # -----------------------------------------------------------------------------
-# Shape/masking helpers (frames -> canonical feature matrix X with shape (N, D))
+# Shape / masking helpers
 # -----------------------------------------------------------------------------
 
 
-def _require_2d_frames(frames: Array) -> tuple[int, int, int]:
+def _validate_frame_batch(frames: Array) -> tuple[int, int, int]:
     """
-    Validate frame batch has shape (N, T, F) or (N, T, F, C).
+    Validate that `frames` has shape `(N, T, F)` or `(N, T, F, C)`.
+
+    Parameters
+    ----------
+    frames
+        Input frame batch.
 
     Returns
     -------
     N, T, F
-        Batch size and time/frequency dimensions. If frames include a channel
-        dimension, it is treated as additional features during flattening.
+        Batch size and time/frequency dimensions.
+
+    Notes
+    -----
+    If a channel dimension is present, it is treated as extra features during
+    flattening.
     """
     if frames.ndim == 3:
         n, t, f = frames.shape
@@ -130,75 +129,141 @@ def _require_2d_frames(frames: Array) -> tuple[int, int, int]:
 
 def _as_freq_mask(freq_mask: Optional[Array], f: int) -> Array:
     """
-    Normalize `freq_mask` to a boolean array of shape (F,).
+    Normalize `freq_mask` to a boolean array of shape `(F,)`.
 
-    Convention
+    Parameters
     ----------
-    True means "keep", False means "masked".
+    freq_mask
+        Optional frequency mask.
+    f
+        Number of frequency channels.
+
+    Returns
+    -------
+    mask
+        Boolean mask of shape `(F,)` where `True` means keep.
+
+    Notes
+    -----
+    Convention:
+    - `True`  => channel is kept
+    - `False` => channel is masked / ignored
     """
     if freq_mask is None:
         return np.ones((f,), dtype=bool)
+
     m = np.asarray(freq_mask, dtype=bool)
     if m.ndim != 1 or m.shape[0] != f:
         raise ValueError(f"freq_mask must have shape (F,), got {m.shape}, expected ({f},).")
     return m
 
 
-def _masked_view(frames: Array, freq_mask: Array) -> Array:
+def _frames_to_X(frames: Array, *, freq_mask: Optional[Array]) -> Array:
     """
-    Apply `freq_mask` to frames along frequency axis.
+    Convert raw frames to a canonical feature matrix `X` of shape `(N, D)`.
 
     Parameters
     ----------
     frames
-        (N, T, F) or (N, T, F, C)
+        Frame batch of shape `(N, T, F)` or `(N, T, F, C)`.
     freq_mask
-        (F,) boolean. True kept.
+        Optional boolean mask of shape `(F,)`.
 
     Returns
     -------
-    masked
-        (N, T, F_kept) or (N, T, F_kept, C)
-    """
-    if frames.ndim == 3:
-        return frames[:, :, freq_mask]
-    return frames[:, :, freq_mask, :]
-
-
-def _flatten_frames(frames: Array) -> Array:
-    """
-    Flatten frames to feature rows.
-
-    (N, T, F)    -> (N, T*F)
-    (N, T, F, C) -> (N, T*F*C)
+    X
+        Flattened feature matrix of shape `(N, D)`.
 
     Notes
     -----
-    Channel dimension (if present) is treated as additional features.
+    Steps:
+    - validate the frame batch shape
+    - apply `freq_mask` along the frequency axis
+    - flatten `(T, F[, C])` into one feature dimension
     """
-    n = int(frames.shape[0])
-    return np.reshape(frames, (n, -1))
-
-
-def _frames_to_X(frames: Array, *, freq_mask: Optional[Array]) -> Array:
-    """
-    Convert raw frames to canonical feature matrix X of shape (N, D).
-
-    Steps
-    -----
-    - Validate shape is (N, T, F) or (N, T, F, C)
-    - Apply `freq_mask` along frequency axis if provided
-    - Flatten (T, F[, C]) into feature dimension D
-    """
-    _n, _t, f = _require_2d_frames(frames)
+    n, _t, f = _validate_frame_batch(frames)
     m = _as_freq_mask(freq_mask, f)
-    x = _masked_view(frames, m)
-    return _flatten_frames(x)
+
+    if frames.ndim == 3:
+        x = frames[:, :, m]
+    else:
+        x = frames[:, :, m, :]
+
+    return np.reshape(x, (n, -1))
 
 
 # -----------------------------------------------------------------------------
-# Unified metric core (operates on canonical X with shape (N, D))
+# Unified metric core
 # -----------------------------------------------------------------------------
+
+
+def _compute_metric_on_valid_rows(
+    Xv: Array,
+    *,
+    method: MetricMethod,
+    q: float,
+    topk: int,
+    thr: float,
+    p: float,
+) -> Array:
+    """
+    Compute a per-row metric on a matrix whose rows are already known to be valid.
+
+    Parameters
+    ----------
+    Xv
+        2D feature matrix `(Nv, D)` containing only rows that passed the
+        `min_finite_frac` validity check.
+    method
+        Metric method.
+    q, topk, thr, p
+        Method-specific parameters.
+
+    Returns
+    -------
+    scores
+        1D array of length `Nv`.
+    """
+    m = str(method)
+
+    if m == "p99":
+        return np.nanpercentile(Xv, 99.0, axis=1)
+
+    if m == "p995":
+        return np.nanpercentile(Xv, 99.5, axis=1)
+
+    if m == "p999":
+        return np.nanpercentile(Xv, 99.9, axis=1)
+
+    if m == "percentile":
+        return np.nanpercentile(Xv, float(q), axis=1)
+
+    if m == "topk_sum":
+        X2 = np.where(np.isfinite(Xv), Xv, -np.inf)
+        kk = int(max(1, min(int(topk), X2.shape[1])))
+        part = np.partition(X2, X2.shape[1] - kk, axis=1)[:, -kk:]
+        sv = np.sum(part, axis=1)
+        sv[~np.isfinite(sv)] = np.nan
+        return sv
+
+    if m == "excess_mass":
+        return np.nansum(np.maximum(Xv - float(thr), 0.0), axis=1)
+
+    if m == "l1":
+        return np.nansum(np.abs(Xv), axis=1)
+
+    if m == "l2":
+        X2 = np.where(np.isfinite(Xv), Xv, 0.0)
+        return np.sqrt(np.sum(X2 * X2, axis=1))
+
+    if m == "lp":
+        pp = float(p)
+        if pp < 1.0:
+            raise ValueError("p must be >= 1.")
+        X2 = np.where(np.isfinite(Xv), Xv, 0.0)
+        return np.sum(np.abs(X2) ** pp, axis=1) ** (1.0 / pp)
+
+    raise ValueError(f"Unknown method: {method!r}")
 
 
 def compute_metric(
@@ -215,155 +280,73 @@ def compute_metric(
     """
     Compute a per-row metric on a feature matrix with NaN-aware handling.
 
-    This function evaluates an outlier or quietness metric independently
-    for each row of a 2D feature matrix. NaN values are handled explicitly
-    so that frames with partial missing data can still be scored.
-
     Parameters
     ----------
-    X : Array
-        Feature matrix of shape (N, D) where each row corresponds to one
-        frame and columns correspond to flattened features (e.g., time–
-        frequency pixels after masking and preprocessing).
-
-    method : MetricMethod
-        Name of the metric to compute. Supported methods are:
-
-        Percentile-based
-            "p99", "p995", "p999"
-                Fixed percentile aliases.
-            "percentile"
-                Percentile specified by ``q``.
-
-        Tail / threshold metrics
-            "topk_sum"
-                Sum of the largest ``topk`` values in each row.
-            "excess_mass"
-                Sum of ``max(x - thr, 0)`` across the row.
-
-        Norm-based metrics
-            "l1"
-                L1 norm (sum of absolute values).
-            "l2"
-                L2 norm.
-            "lp"
-                General Lp norm using exponent ``p``.
-
-    q : float, optional
-        Percentile used when ``method="percentile"`` (default 99.9).
-
-    topk : int, optional
-        Number of largest elements summed when ``method="topk_sum"``.
-
-    thr : float, optional
-        Threshold used for ``method="excess_mass"``.
-
-    p : float, optional
-        Exponent used when ``method="lp"`` (must be >= 1).
-
-    min_finite_frac : float, optional
-        Minimum fraction of finite values required in a row for it to be
-        considered valid. Rows with fewer finite values than this threshold
-        receive a score of NaN.
-
-        For example:
-        - ``1.0`` requires all elements to be finite.
-        - ``0.7`` allows up to 30% missing values.
-
-    normalize_missing : bool, optional
-        If True, metrics that depend on summation or norms are rescaled to
-        compensate for missing features so that scores remain comparable
-        across rows with different numbers of finite values.
-
-        Normalization rules:
-
-        - L1-like metrics ("topk_sum", "excess_mass", "l1")
-              scale by ``D / n_finite``
-        - L2 norm
-              scale by ``sqrt(D / n_finite)``
-        - Lp norm
-              scale by ``(D / n_finite) ** (1/p)``
-
-        Percentile-based metrics are not normalized.
+    X
+        Feature matrix of shape `(N, D)`.
+    method
+        Metric method.
+    q
+        Percentile used when `method="percentile"`.
+    topk
+        Number of largest elements summed when `method="topk_sum"`.
+    thr
+        Threshold used when `method="excess_mass"`.
+    p
+        Exponent used when `method="lp"`.
+    min_finite_frac
+        Minimum fraction of finite values required for a row to receive a
+        score. Rows failing this requirement receive NaN.
+    normalize_missing
+        If True, metrics based on summation / norms are rescaled to compensate
+        for missing values so scores remain more comparable across rows with
+        different finite fractions.
 
     Returns
     -------
-    scores : Array
-        Array of shape (N,) containing the computed metric for each row.
-        Rows failing the ``min_finite_frac`` requirement receive NaN.
+    scores
+        Array of shape `(N,)`. Invalid rows receive NaN.
 
     Notes
     -----
-    - NaN values are ignored during metric evaluation using NumPy
-      ``nan*`` functions where appropriate.
-    - Rows with no finite values are always assigned NaN.
-    - The validity check (``min_finite_frac``) is applied before computing
-      metrics to avoid warnings from functions such as
-      ``np.nanpercentile`` on all-NaN slices.
-    - Missingness normalization can help prevent partially-missing rows
-      from systematically producing smaller scores simply due to having
-      fewer contributing features.
+    Percentile-based metrics are never missingness-normalized.
     """
     X = np.asarray(X)
     if X.ndim != 2:
         raise ValueError("X must be (N, D).")
 
-    N, D = X.shape
+    if not (0.0 < float(min_finite_frac) <= 1.0):
+        raise ValueError("min_finite_frac must be in (0, 1].")
+
+    n, d = X.shape
     finite = np.isfinite(X)
     n_finite = finite.sum(axis=1).astype(np.float64)
-    frac = n_finite / float(D)
+    frac = n_finite / float(d)
 
     valid = (n_finite > 0) & (frac >= float(min_finite_frac))
 
-    scores = np.full((N,), np.nan, dtype=np.float64)
+    scores = np.full((n,), np.nan, dtype=np.float64)
     if not np.any(valid):
         return scores
 
     Xv = X[valid]
+    sv = _compute_metric_on_valid_rows(
+        Xv,
+        method=method,
+        q=float(q),
+        topk=int(topk),
+        thr=float(thr),
+        p=float(p),
+    )
 
-    # --- compute metric on valid rows (NaN-aware inside each) ---
-    m = str(method)
-    if m == "p99":
-        sv = np.nanpercentile(Xv, 99.0, axis=1)
-    elif m == "p995":
-        sv = np.nanpercentile(Xv, 99.5, axis=1)
-    elif m == "p999":
-        sv = np.nanpercentile(Xv, 99.9, axis=1)
-    elif m == "percentile":
-        sv = np.nanpercentile(Xv, float(q), axis=1)
-    elif m == "topk_sum":
-        X2 = np.where(np.isfinite(Xv), Xv, -np.inf)
-        kk = int(max(1, min(int(topk), X2.shape[1])))
-        part = np.partition(X2, X2.shape[1] - kk, axis=1)[:, -kk:]
-        sv = np.sum(part, axis=1)
-        sv[~np.isfinite(sv)] = np.nan
-    elif m == "excess_mass":
-        sv = np.nansum(np.maximum(Xv - float(thr), 0.0), axis=1)
-    elif m == "l1":
-        sv = np.nansum(np.abs(Xv), axis=1)
-    elif m == "l2":
-        X2 = np.where(np.isfinite(Xv), Xv, 0.0)
-        sv = np.sqrt(np.sum(X2 * X2, axis=1))
-    elif m == "lp":
-        pp = float(p)
-        if pp < 1.0:
-            raise ValueError("p must be >= 1.")
-        X2 = np.where(np.isfinite(Xv), Xv, 0.0)
-        sv = np.sum(np.abs(X2) ** pp, axis=1) ** (1.0 / pp)
-    else:
-        raise ValueError(f"Unknown method: {method!r}")
-
-    # --- optional missingness normalization (not for percentiles) ---
-    if normalize_missing and m not in {"p99", "p995", "p999", "percentile"}:
-        nv = n_finite[valid]
-        # guard
-        nv = np.maximum(nv, 1.0)
-        if m in {"topk_sum", "excess_mass", "l1"}:
-            sv = sv * (float(D) / nv)
-        elif m == "l2":
-            sv = sv * np.sqrt(float(D) / nv)
-        elif m == "lp":
-            sv = sv * (float(D) / nv) ** (1.0 / float(p))
+    if normalize_missing and str(method) not in {"p99", "p995", "p999", "percentile"}:
+        nv = np.maximum(n_finite[valid], 1.0)
+        if method in {"topk_sum", "excess_mass", "l1"}:
+            sv = sv * (float(d) / nv)
+        elif method == "l2":
+            sv = sv * np.sqrt(float(d) / nv)
+        elif method == "lp":
+            sv = sv * (float(d) / nv) ** (1.0 / float(p))
 
     scores[valid] = sv
     return scores
@@ -379,35 +362,24 @@ class QuietSelector:
     """
     Select a quiet subset of frames for background modeling.
 
-    Quietness is computed from *unmasked* frequency channels only.
+    Quietness is computed from the same masked feature representation used
+    elsewhere in this module. Lower metric values are interpreted as quieter.
 
     Parameters
     ----------
     method
-        Quietness metric. Lower is "quieter".
-        Uses the unified MetricMethod vocabulary.
-
-        Recommended starting points:
-        - "p99": conservative, tends to reject frames with any bright-ish pixels
-        - "topk_sum": more sensitive to sparse bright structure if topk is smallish
-        - "excess_mass": good for "above-threshold" type quietness
+        Quietness metric. Lower is quieter.
     quiet_fraction
-        Fraction of frames to keep as quiet (0 < quiet_fraction <= 1).
-        Selection is by ascending quietness score.
+        Fraction of finite-scored frames to keep as quiet. Must lie in `(0, 1]`.
     freq_mask
-        Boolean mask of shape (F,). True means keep the channel.
-        If None, all channels are used.
-
-    Metric parameters
-    -----------------
-    q
-        Used when method="percentile".
-    topk
-        Used for method="topk_sum".
-    thr
-        Used for method="excess_mass".
-    p
-        Used for method="lp".
+        Optional boolean mask of shape `(F,)`. `True` means keep the channel.
+    q, topk, thr, p
+        Metric-specific parameters passed to `compute_metric()`.
+    min_finite_frac
+        Minimum finite fraction required for a frame to receive a quietness
+        score. Frames failing this are excluded from quiet selection.
+    normalize_missing
+        If True, apply missingness normalization for norm/sum-based metrics.
     """
 
     method: MetricMethod = "p99"
@@ -418,6 +390,8 @@ class QuietSelector:
     topk: int = 2048
     thr: float = 3.0
     p: float = 4.0
+    min_finite_frac: float = 1.0
+    normalize_missing: bool = False
 
     def scores(self, frames: Array) -> Array:
         """
@@ -426,12 +400,12 @@ class QuietSelector:
         Parameters
         ----------
         frames
-            Frame batch of shape (N, T, F) or (N, T, F, C).
+            Frame batch of shape `(N, T, F)` or `(N, T, F, C)`.
 
         Returns
         -------
         scores
-            (N,) array. Lower is quieter.
+            1D array of shape `(N,)`. Lower is quieter.
         """
         X = _frames_to_X(frames, freq_mask=self.freq_mask)
         return compute_metric(
@@ -441,37 +415,45 @@ class QuietSelector:
             topk=int(self.topk),
             thr=float(self.thr),
             p=float(self.p),
+            min_finite_frac=float(self.min_finite_frac),
+            normalize_missing=bool(self.normalize_missing),
         )
 
     def select_quiet(self, frames: Array) -> Array:
         """
-        Return indices of quiet frames (ascending by quietness).
+        Return indices of quiet frames, sorted by ascending quietness.
 
         Parameters
         ----------
         frames
-            Frame batch of shape (N, T, F) or (N, T, F, C).
+            Frame batch of shape `(N, T, F)` or `(N, T, F, C)`.
 
         Returns
         -------
         idx
-            1D integer array of selected indices (sorted ascending by quietness).
+            1D integer array of selected frame indices.
 
         Notes
         -----
-        NaN scores are treated as non-quiet and tend to appear at the end of the
-        ordering produced by np.argsort.
+        Only frames with finite quietness scores are eligible for selection.
+        Frames whose scores are NaN are treated as unusable rather than merely
+        "non-quiet".
         """
-        s = self.scores(frames)
-        n = int(s.size)
-
         qf = float(self.quiet_fraction)
         if not (0.0 < qf <= 1.0):
             raise ValueError("quiet_fraction must be in (0, 1].")
 
-        k = int(max(1, np.floor(qf * n)))
-        order = np.argsort(s)
-        return order[:k]
+        s = self.scores(frames)
+        finite = np.isfinite(s)
+        if not np.any(finite):
+            raise ValueError("No finite quietness scores available.")
+
+        idx_valid = np.where(finite)[0]
+        s_valid = s[finite]
+
+        k = int(max(1, np.floor(qf * s_valid.size)))
+        order = np.argsort(s_valid)
+        return idx_valid[order[:k]]
 
 
 @dataclass
@@ -479,45 +461,44 @@ class RollingPCABackground:
     """
     PCA background model fit on quiet frames.
 
-    This object is intentionally "stateless with respect to time": it does not
-    manage dataset iteration by itself. Instead, you:
-      - build batches/chunks of frames externally,
-      - select quiet frames with QuietSelector,
-      - call fit() on the quiet subset,
-      - call reconstruct()/residuals()/score() on frames of interest.
+    This object is intentionally stateless with respect to time: it does not
+    manage dataset iteration itself. Instead, callers are expected to:
+
+    - assemble batches or rolling contexts of frames externally
+    - select quiet frames with `QuietSelector`
+    - call `fit()` on the quiet subset
+    - call `reconstruct()`, `residuals()`, or `score()` on frames of interest
 
     Parameters
     ----------
     k
         Number of PCA components to fit.
     center
-        If True, mean-center features before SVD (classic PCA). Strongly recommended.
+        If True, mean-center features before SVD.
     freq_mask
-        Optional boolean mask of shape (F,) applied before flattening.
-        If provided, PCA ignores masked channels entirely.
+        Optional boolean mask of shape `(F,)` applied before flattening.
     use_randomized
-        If True and scikit-learn is available, use randomized SVD.
+        If True, use scikit-learn's randomized SVD.
     n_iter
-        Power iterations for randomized SVD (typical 1–3).
+        Power iterations for randomized SVD.
     random_state
         Seed for randomized SVD.
 
-    Learned attributes (after fit)
-    ------------------------------
+    Learned attributes
+    ------------------
     mu_
-        Mean vector (D,) if center=True, else None.
+        Mean vector of shape `(D,)` if `center=True`, else None.
     Vt_
-        Components (k, D). Rows are basis vectors in feature space.
+        PCA basis vectors of shape `(k, D)`.
     S_
-        Singular values (k,).
+        Singular values of shape `(k,)`.
 
     Notes
     -----
-    - The PCA model is trained in the same feature space produced by masking +
-      flattening. If you pass freq_mask, you should use the same mask for quiet
-      selection and scoring for consistency.
-    - NaN handling: during fit(), any frame rows containing non-finite features
-      are dropped (conservative).
+    - The PCA model is trained in the same masked feature space used for
+      scoring.
+    - During `fit()`, rows containing any non-finite feature values are
+      dropped conservatively.
     """
 
     k: int = 256
@@ -527,23 +508,24 @@ class RollingPCABackground:
     n_iter: int = 2
     random_state: int = 0
 
-    # learned
     mu_: Optional[Array] = None
     Vt_: Optional[Array] = None
     S_: Optional[Array] = None
 
     def _prep(self, frames: Array) -> Array:
-        """Apply mask (if any) and flatten to feature matrix X (N, D)."""
+        """
+        Apply frequency masking (if any) and flatten to feature matrix `(N, D)`.
+        """
         return _frames_to_X(frames, freq_mask=self.freq_mask)
 
-    def fit(self, quiet_frames: Array) -> "RollingPCABackground":
+    def fit(self, quiet_frames: Array) -> RollingPCABackground:
         """
-        Fit PCA model on quiet frames.
+        Fit the PCA model on quiet frames.
 
         Parameters
         ----------
         quiet_frames
-            Array of shape (Nq, T, F) or (Nq, T, F, C).
+            Array of shape `(Nq, T, F)` or `(Nq, T, F, C)`.
 
         Returns
         -------
@@ -587,40 +569,46 @@ class RollingPCABackground:
 
     def reconstruct(self, frames: Array, *, k: Optional[int] = None) -> Array:
         """
-        Low-rank reconstruction of frames in feature space.
+        Compute a low-rank reconstruction of frames in feature space.
 
         Parameters
         ----------
         frames
-            (N, T, F) or (N, T, F, C)
+            Array of shape `(N, T, F)` or `(N, T, F, C)`.
         k
-            Number of PCA components to use. Defaults to self.k.
+            Number of PCA components to use. Defaults to `self.k`.
 
         Returns
         -------
         X_hat
-            (N, D) reconstruction in feature space.
+            Reconstructed feature matrix of shape `(N, D)`.
+
+        Notes
+        -----
+        Missing values are treated as "no deviation" only for the projection
+        step. That is, NaNs are zero-filled when projecting into the PCA
+        subspace, but residuals are still formed against the original feature
+        matrix so missing entries propagate naturally back into the residual.
         """
         if self.Vt_ is None:
             raise RuntimeError("Model is not fit yet. Call fit() first.")
 
-        X = self._prep(frames)  # (N, D)
+        X = self._prep(frames)
 
         if self.center and self.mu_ is not None:
             Xc = X - self.mu_
         else:
             Xc = X
 
-        # NaN-robust projection input: treat missing entries as "no deviation"
         finite = np.isfinite(Xc)
         Xc_proj = np.where(finite, Xc, 0.0)
 
         kk = int(self.k if k is None else k)
         kk = min(kk, int(self.Vt_.shape[0]))
 
-        V = self.Vt_[:kk, :]  # (kk, D)
-        C = Xc_proj @ V.T  # (N, kk)
-        X_hat = C @ V  # (N, D)
+        V = self.Vt_[:kk, :]
+        C = Xc_proj @ V.T
+        X_hat = C @ V
 
         if self.center and self.mu_ is not None:
             X_hat = X_hat + self.mu_
@@ -629,12 +617,19 @@ class RollingPCABackground:
 
     def residuals(self, frames: Array, *, k: Optional[int] = None) -> Array:
         """
-        Residuals in feature space: R = X - X_hat.
+        Compute residuals in feature space: `R = X - X_hat`.
+
+        Parameters
+        ----------
+        frames
+            Array of shape `(N, T, F)` or `(N, T, F, C)`.
+        k
+            Number of PCA components used in reconstruction.
 
         Returns
         -------
         R
-            (N, D) residual feature matrix.
+            Residual feature matrix of shape `(N, D)`.
         """
         X = self._prep(frames)
         X_hat = self.reconstruct(frames, k=k)
@@ -644,49 +639,62 @@ class RollingPCABackground:
         self,
         frames: Array,
         *,
-        method: MetricMethod = "topk_sum",
         k_pca: Optional[int] = None,
-        positive_only: bool = True,
-        # metric params
-        q: float = 99.9,
-        topk: int = 2048,
-        thr: float = 3.0,
-        p: float = 4.0,
-        min_finite_frac: float = 0.7,
-        normalize_missing: bool = True,
+        metric_kwargs: Optional[dict[str, Any]] = None,
+        **metric_overrides: Any,
     ) -> Array:
         """
-        Score outliers using residuals against the PCA background model.
+        Score outliers using PCA residuals.
 
         Parameters
         ----------
         frames
-            (N, T, F) or (N, T, F, C).
-        method
-            MetricMethod applied to residuals (after optional positive clipping).
+            Array of shape `(N, T, F)` or `(N, T, F, C)`.
         k_pca
-            Number of PCA modes to use for reconstruction. If None, uses self.k.
-        positive_only
-            If True, residuals are clipped to positive values (bright-only detection).
-        q, topk, thr, p
-            Metric parameters (see compute_metric).
+            Number of PCA modes to use for reconstruction. If None, uses `self.k`.
+        metric_kwargs
+            Optional metric configuration dictionary. Supported keys include:
+            - `method`
+            - `q`
+            - `topk`
+            - `thr`
+            - `p`
+            - `positive_only`
+            - `min_finite_frac`
+            - `normalize_missing`
+        **metric_overrides
+            Additional keyword overrides merged on top of `metric_kwargs`.
 
         Returns
         -------
         scores
-            (N,) array. Higher means "more outlier-like".
+            1D array of shape `(N,)`. Higher means more outlier-like.
+
+        Notes
+        -----
+        This method accepts a config dict so it can integrate cleanly with
+        higher-level workflow code that already stores metric parameters as
+        dictionaries.
         """
+        cfg: dict[str, Any] = {
+            "method": "topk_sum",
+            "q": 99.9,
+            "topk": 2048,
+            "thr": 3.0,
+            "p": 4.0,
+            "positive_only": True,
+            "min_finite_frac": 0.7,
+            "normalize_missing": True,
+        }
+        if metric_kwargs is not None:
+            cfg.update(metric_kwargs)
+        if metric_overrides:
+            cfg.update(metric_overrides)
+
+        positive_only = bool(cfg.pop("positive_only", True))
+
         R = self.residuals(frames, k=k_pca)
         if positive_only:
             R = np.clip(R, 0.0, None)
 
-        return compute_metric(
-            R,
-            method=method,
-            q=float(q),
-            topk=int(topk),
-            thr=float(thr),
-            p=float(p),
-            min_finite_frac=float(min_finite_frac),
-            normalize_missing=bool(normalize_missing),
-        )
+        return compute_metric(R, **cfg)
