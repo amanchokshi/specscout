@@ -211,6 +211,5 @@ __marimo__/
 .DS_Store
 data
 roi_grid
-src/specscout/scripts
 notebooks
 slurm/logs
