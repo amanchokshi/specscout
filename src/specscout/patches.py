@@ -17,10 +17,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Callable, Iterator, Optional
+from pathlib import Path
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional, Sequence
 
 import numpy as np
+import pandas as pd
 import zarr
+
+from .core import parse_utc
+
+if TYPE_CHECKING:
+    from .preprocess import PreprocessPipeline
+Array = np.ndarray
 
 
 @dataclass(frozen=True)
@@ -291,3 +300,205 @@ def iter_patches(
         if transform is not None:
             p = transform(p)
         yield p
+
+
+def _coerce_utc_timestamp(t: str | datetime | pd.Timestamp) -> pd.Timestamp:
+    """
+    Normalize a time input to a timezone-aware UTC pandas Timestamp.
+
+    Parameters
+    ----------
+    t
+        Input time. Supported types:
+        - str in ``YYYYmmdd_HHMMSS`` format
+        - datetime
+        - pandas.Timestamp
+
+    Returns
+    -------
+    pandas.Timestamp
+        UTC-normalized timestamp.
+    """
+    if isinstance(t, str):
+        return pd.Timestamp(parse_utc(t), tz="UTC")
+    if isinstance(t, pd.Timestamp):
+        return pd.to_datetime(t, utc=True)
+    if isinstance(t, datetime):
+        return pd.Timestamp(t).tz_convert("UTC") if t.tzinfo else pd.Timestamp(t, tz="UTC")
+    raise TypeError(f"Unsupported time type: {type(t)!r}")
+
+
+def _normalize_chans(chans: int | Sequence[int]) -> tuple[int, ...]:
+    """
+    Normalize a channel selection to a tuple of integers.
+
+    Parameters
+    ----------
+    chans
+        Either a single integer channel index or a sequence of indices.
+
+    Returns
+    -------
+    tuple[int, ...]
+        Normalized channel tuple.
+    """
+    if isinstance(chans, int):
+        return (int(chans),)
+    return tuple(int(c) for c in chans)
+
+
+def read_time_range(
+    zarr_path: str | Path,
+    *,
+    start_utc: str | datetime | pd.Timestamp,
+    stop_utc: str | datetime | pd.Timestamp,
+    chans: int | Sequence[int],
+    pipe: PreprocessPipeline | None = None,
+    dtype: np.dtype = np.float32,
+    squeeze_single_channel: bool = True,
+) -> tuple[Array, pd.DatetimeIndex, Any]:
+    """
+    Read a contiguous time range from a specscout Zarr cube.
+
+    This is a low-level, sample-based reader intended for quicklooks, ROI
+    inspection, and general data extraction. It reads the requested interval
+    directly from the underlying Zarr cube rather than reconstructing it from
+    overlapping analysis frames.
+
+    Parameters
+    ----------
+    zarr_path
+        Path to a specscout Zarr store.
+    start_utc
+        Inclusive UTC start time. Supported forms:
+        - ``YYYYmmdd_HHMMSS`` string
+        - ``datetime``
+        - ``pandas.Timestamp``
+    stop_utc
+        Exclusive UTC stop time. Supported forms are the same as `start_utc`.
+    chans
+        Channel selection from the last axis of the Zarr cube.
+        Examples:
+        - ``0`` for `pol00`
+        - ``1`` for `pol11`
+        - ``(0, 1)`` for dual-pol loading prior to a Stokes-I pipeline
+        - ``(0, 1, 2, 3)`` for all stored channels
+    pipe
+        Optional preprocessing pipeline applied to the extracted block after
+        reading. The pipeline receives the extracted array and a lightweight
+        metadata object with fields such as:
+        - ``start_time_utc``
+        - ``t_start_idx``
+        - ``dt_s``
+        - ``frame_idx``
+
+        This is intended to support transformations such as:
+        - `step_stokes_i()`
+        - `step_safe_db()`
+
+    dtype
+        Output dtype for the loaded array prior to any pipeline application.
+    squeeze_single_channel
+        If True and exactly one channel is requested, return shape ``(T, F)``
+        instead of ``(T, F, 1)``.
+
+    Returns
+    -------
+    data
+        Extracted array. Shape is:
+        - ``(T, F)`` if one channel is requested and `squeeze_single_channel=True`
+        - ``(T, F, C)`` otherwise
+    times
+        UTC DatetimeIndex of length ``T`` giving the timestamp of each sample.
+    meta
+        Lightweight metadata object suitable for passing into preprocessing
+        pipelines.
+
+    Notes
+    -----
+    - The returned interval is clipped to the extant cube bounds.
+    - If the requested time range lies fully outside the cube, an empty array
+      and empty DatetimeIndex are returned.
+    - Missing data internal to the cube remain as NaNs.
+    - This helper is intentionally sample-based and does not use
+      `SpecscoutDataset` frame construction.
+    """
+    zarr_path = Path(zarr_path)
+    start_ts = _coerce_utc_timestamp(start_utc)
+    stop_ts = _coerce_utc_timestamp(stop_utc)
+
+    if not (start_ts < stop_ts):
+        raise ValueError("start_utc must be earlier than stop_utc.")
+
+    chans_t = _normalize_chans(chans)
+    if len(chans_t) == 0:
+        raise ValueError("At least one channel must be requested.")
+
+    cube, attrs, _time_axis = open_cube(zarr_path)
+
+    dt_s = float(attrs["dt_seconds"])
+    t0_unix = float(attrs["t0_unix_seconds"])
+    nt, nfreq, nchan_total = cube.shape
+
+    for c in chans_t:
+        if not (0 <= c < nchan_total):
+            raise ValueError(f"Requested channel {c} out of bounds for cube with nchan={nchan_total}.")
+
+    # Map requested times to sample indices.
+    start_unix = start_ts.timestamp()
+    stop_unix = stop_ts.timestamp()
+
+    i0 = int(np.floor((start_unix - t0_unix) / dt_s))
+    i1 = int(np.ceil((stop_unix - t0_unix) / dt_s))
+
+    # Clip to cube bounds.
+    i0_clip = max(0, min(nt, i0))
+    i1_clip = max(0, min(nt, i1))
+
+    if i1_clip <= i0_clip:
+        empty_shape = (0, nfreq) if (len(chans_t) == 1 and squeeze_single_channel) else (0, nfreq, len(chans_t))
+        data = np.empty(empty_shape, dtype=dtype)
+        times = pd.DatetimeIndex([], tz="UTC")
+        meta = SimpleNamespace(
+            start_time_utc=start_ts.to_pydatetime(),
+            t_start_idx=i0_clip,
+            dt_s=dt_s,
+            frame_idx=-1,
+        )
+        return data, times, meta
+
+    # Read channel selection in a Zarr-friendly way.
+    if len(chans_t) == 1:
+        arr = np.asarray(cube[i0_clip:i1_clip, :, chans_t[0]], dtype=dtype)
+        if not squeeze_single_channel:
+            arr = arr[:, :, None]
+    else:
+        # If channels are contiguous, use a slice for efficient basic indexing.
+        is_contiguous = all(chans_t[j] == chans_t[0] + j for j in range(len(chans_t)))
+
+        if is_contiguous:
+            c0 = chans_t[0]
+            c1 = chans_t[-1] + 1
+            arr = np.asarray(cube[i0_clip:i1_clip, :, c0:c1], dtype=dtype)
+        else:
+            # General fallback: read one channel at a time and stack.
+            arr = np.stack(
+                [np.asarray(cube[i0_clip:i1_clip, :, c], dtype=dtype) for c in chans_t],
+                axis=2,
+            )
+
+    # Build per-sample UTC timestamps from cube metadata.
+    sample_unix = t0_unix + np.arange(i0_clip, i1_clip, dtype=np.float64) * dt_s
+    times = pd.to_datetime(sample_unix, unit="s", utc=True)
+
+    meta = SimpleNamespace(
+        start_time_utc=datetime.fromtimestamp(sample_unix[0], tz=UTC),
+        t_start_idx=i0_clip,
+        dt_s=dt_s,
+        frame_idx=-1,
+    )
+
+    if pipe is not None:
+        arr = pipe(arr, meta)
+
+    return arr, times, meta
