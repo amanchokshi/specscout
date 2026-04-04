@@ -10,6 +10,7 @@ from .ingest import (
     infer_available_utc_bounds,
     ingest_direct_spectra_to_zarr,
 )
+from .roi_search import run_roi_search
 
 
 def _build_default_out_path(
@@ -65,6 +66,43 @@ def ingest_cmd(args: argparse.Namespace) -> None:
         station=args.station,
     )
     print(f"Wrote {out}")
+
+
+def roi_search_cmd(args: argparse.Namespace) -> None:
+    result = run_roi_search(
+        args.zarr_path,
+        station=args.station,
+        analysis_start_utc=args.startutc,
+        analysis_stop_utc=args.stoputc,
+        out_dir=args.out_dir,
+        window_seconds=args.window_minutes * 60.0,
+        step_seconds=args.step_minutes * 60.0,
+        context_hours=args.context_hours,
+        stride_hours=args.stride_hours,
+        score_hours=args.score_hours,
+        gap_hours=args.gap_hours,
+        quiet_fraction=args.quiet_fraction,
+        n_quiet=args.n_quiet,
+        k_fit=args.k_fit,
+        k_pca=args.k_pca,
+        min_finite_frac=args.min_finite_frac,
+        nsig=args.nsig,
+        pad_minutes=args.pad_minutes,
+        merge_gap_minutes=args.merge_gap_minutes,
+        rfi_mask_start=args.rfi_mask_start,
+        rfi_mask_stop=args.rfi_mask_stop,
+        random_state=args.random_state,
+    )
+
+    print("ROI search complete.")
+    print(f"  out_dir     : {result.out_dir}")
+    print(f"  scores.pkl  : {result.scores_path}")
+    print(f"  rois.pkl    : {result.rois_path}")
+    print(f"  config.json : {result.config_path}")
+    print(f"  summary.png : {result.summary_plot_path}")
+    print(f"  roi plots   : {result.roi_plot_dir}")
+    print(f"  n_scores    : {result.n_scores}")
+    print(f"  n_rois      : {result.n_rois}")
 
 
 def zarrmeta_cmd(args: argparse.Namespace) -> None:
@@ -165,6 +203,65 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print all attributes (not just key fields).",
     )
     zmeta.set_defaults(func=zarrmeta_cmd)
+
+    # roi-search
+    roi = subparsers.add_parser(
+        "roi-search",
+        help="Run rolling PCA ROI search on a station-season Zarr product.",
+    )
+    roi.add_argument(
+        "zarr_path",
+        type=Path,
+        help="Path to station-season .zarr directory.",
+    )
+    roi.add_argument(
+        "--station",
+        required=True,
+        help='Station label, e.g. "MARS1".',
+    )
+    roi.add_argument(
+        "--startutc",
+        required=True,
+        help="Analysis start UTC in YYYYmmdd_HHMMSS format.",
+    )
+    roi.add_argument(
+        "--stoputc",
+        required=True,
+        help="Analysis stop UTC in YYYYmmdd_HHMMSS format.",
+    )
+    roi.add_argument(
+        "--out-dir",
+        type=Path,
+        required=True,
+        help="Output directory for scores, ROIs, config, and plots.",
+    )
+
+    roi.add_argument("--window-minutes", type=float, default=20.0)
+    roi.add_argument("--step-minutes", type=float, default=5.0)
+
+    roi.add_argument("--context-hours", type=float, default=24.0)
+    roi.add_argument("--stride-hours", type=float, default=1.0)
+    roi.add_argument("--score-hours", type=float, default=1.0)
+    roi.add_argument("--gap-hours", type=float, default=0.0)
+
+    roi.add_argument("--quiet-fraction", type=float, default=0.3)
+    roi.add_argument("--n-quiet", type=int, default=None)
+
+    roi.add_argument("--k-fit", type=int, default=128)
+    roi.add_argument("--k-pca", type=int, default=16)
+
+    roi.add_argument("--min-finite-frac", type=float, default=0.7)
+
+    roi.add_argument("--nsig", type=float, default=3.0)
+    roi.add_argument("--pad-minutes", type=float, default=5.0)
+    roi.add_argument("--merge-gap-minutes", type=float, default=20.0)
+
+    roi.add_argument("--rfi-mask-start", type=int, default=116)
+    roi.add_argument("--rfi-mask-stop", type=int, default=384)
+
+    roi.add_argument("--random-state", type=int, default=42)
+
+    roi.set_defaults(func=roi_search_cmd)
 
     return parser
 
