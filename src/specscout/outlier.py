@@ -79,7 +79,7 @@ Score outliers on residuals (bright-only):
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Literal, Optional
+from typing import Literal, Optional
 
 import numpy as np
 from sklearn.utils.extmath import randomized_svd
@@ -199,57 +199,6 @@ def _frames_to_X(frames: Array, *, freq_mask: Optional[Array]) -> Array:
 # -----------------------------------------------------------------------------
 # Unified metric core (operates on canonical X with shape (N, D))
 # -----------------------------------------------------------------------------
-
-
-def _row_percentile(X: Array, q: float) -> Array:
-    """Per-row percentile over features, ignoring NaNs."""
-    return np.nanpercentile(X, float(q), axis=1)
-
-
-def _row_topk_sum(X: Array, k: int) -> Array:
-    """
-    Per-row sum of the top-k largest values.
-
-    Notes
-    -----
-    - Uses np.partition for efficiency.
-    - NaNs are treated as -inf (ignored).
-    """
-    X2 = np.where(np.isfinite(X), X, -np.inf)
-    k = int(max(1, min(int(k), X2.shape[1])))
-    part = np.partition(X2, X2.shape[1] - k, axis=1)[:, -k:]
-    s = np.sum(part, axis=1)
-    s[~np.isfinite(s)] = np.nan
-    return s
-
-
-def _row_excess_mass(X: Array, thr: float) -> Array:
-    """Per-row sum(max(x - thr, 0)), ignoring NaNs."""
-    return np.nansum(np.maximum(X - float(thr), 0.0), axis=1)
-
-
-def _row_lp(X: Array, p: float) -> Array:
-    """
-    Per-row Lp norm (p>=1), treating NaNs as 0.
-
-    This is: (sum |x|^p)^(1/p)
-    """
-    pp = float(p)
-    if pp < 1.0:
-        raise ValueError("p must be >= 1.")
-    X2 = np.where(np.isfinite(X), X, 0.0)
-    return np.sum(np.abs(X2) ** pp, axis=1) ** (1.0 / pp)
-
-
-def _row_l1(X: Array) -> Array:
-    """Per-row L1 sum of absolute values, ignoring NaNs."""
-    return np.nansum(np.abs(X), axis=1)
-
-
-def _row_l2(X: Array) -> Array:
-    """Per-row L2 norm, treating NaNs as 0."""
-    X2 = np.where(np.isfinite(X), X, 0.0)
-    return np.sqrt(np.sum(X2 * X2, axis=1))
 
 
 def compute_metric(
