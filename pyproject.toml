@@ -60,6 +60,7 @@ dev = [
     "jupyterlab>=4.5.6",
     "poethepoet>=0.42.1",
     "ruff>=0.15.9",
+    "seaborn>=0.13.2",
     "twine>=6.2.0",
 ]
 
@@ -81,6 +82,12 @@ select = [
     "F",  # pyflakes
     "I",  # import sorting
     "N",  # naming
+]
+ignore = [
+    "N806",     # allow uppercase variables
+    "E741",     # allow ambiguous variables
+    "N802",     # function names capital
+    "N803",     # function args capital
 ]
 
 [tool.ruff.lint.isort]
