@@ -44,13 +44,14 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Literal, Optional, Sequence
 
 import numpy as np
 
-from .dataset import FrameMeta
+if TYPE_CHECKING:
+    from .dataset import FrameMeta
 
-Transform = Callable[[np.ndarray, FrameMeta], np.ndarray]
+Transform = Callable[[np.ndarray, "FrameMeta"], np.ndarray]
 DataSpace = Literal["linear", "db"]
 
 

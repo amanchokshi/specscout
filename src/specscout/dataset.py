@@ -26,13 +26,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator, Optional, Sequence
+from typing import TYPE_CHECKING, Iterator, Optional, Sequence
 
 import numpy as np
 
 from .core import clamp_int, freq_axis_from_attrs, parse_utc, seconds_to_samples, time_index
 from .patches import PatchSpec, open_cube, read_patch
-from .preprocess import PreprocessPipeline
+
+if TYPE_CHECKING:
+    from .preprocess import PreprocessPipeline
 
 Array = np.ndarray
 MaybeChans = int | tuple[int, ...]
@@ -254,9 +256,7 @@ class SpecscoutDataset(Sequence):
         if len(chans) == 0:
             raise ValueError("chans must contain at least one channel index.")
         if any((c < 0 or c >= nchan_total) for c in chans):
-            raise ValueError(
-                f"chans out of bounds for cube with nchan={nchan_total}."
-            )
+            raise ValueError(f"chans out of bounds for cube with nchan={nchan_total}.")
 
         if f_stop is None:
             f_stop = nfreq

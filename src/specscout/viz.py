@@ -40,7 +40,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Optional, Sequence, Tuple, Union
 
 import cmasher as cmr
 import ipywidgets as widgets
@@ -53,15 +53,16 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 from .core import (
     CHAN_LABELS,
-    FrameMeta,
     freq_axis_from_attrs,
     parse_utc,
-    plan_frames,
 )
-from .dataset import SpecscoutDataset
+from .dataset import FrameMeta, SpecscoutDataset, plan_frames
 from .patches import PatchSpec, open_cube, read_patch, read_time_range
 from .preprocess import PreprocessPipeline
-from .roi import ROI
+
+...
+if TYPE_CHECKING:
+    from .roi import ROI
 
 
 def plot_scores_with_rois(
