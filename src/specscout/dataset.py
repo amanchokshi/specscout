@@ -1,36 +1,32 @@
 """
-Dataset utilities for turning specscout Zarr cubes into ML-ready examples.
+Dataset utilities for turning specscout Zarr cubes into rolling-window examples.
+
+This module defines the dataset-layer abstractions used throughout specscout:
+
+- `FrameMeta`: metadata for one extracted frame
+- `FramePlan`: a validated sliding-window plan over a cube time range
+- `DatasetPlan`: a compact description of dataset iteration and slicing
+- `SpecscoutDataset`: a lazy, indexable sequence of rolling-window examples
 
 Design goals
 ------------
-- No duplicated Zarr indexing/slicing logic:
-  reading is delegated to `specscout.patches.read_patch`.
-- No duplicated seconds->samples conversion:
-  we compute a single `FramePlan` using `specscout.core.plan_frames`, then reuse
-  `plan.window_n` and `plan.step_n` everywhere.
-- Canonical preprocessing is supplied via a `PreprocessPipeline` (`pipe`), which
-  mirrors `viz.py` usage and ensures consistent patterns across the project.
-- Provide a fast, explicit "load by t_start_idx" entry point so visualization
-  and outlier tooling does not need to reach into dataset internals.
+- Centralize frame-planning logic in one place
+- Reuse low-level Zarr reading via `specscout.patches.read_patch`
+- Apply preprocessing consistently through `PreprocessPipeline`
+- Provide both dataset-indexed access and direct loading by `t_start_idx`
 
-The main entry point is `SpecscoutDataset`, which is a lazy, indexable sequence.
-Each item yields `(x, meta)` by default, where:
-- `x` is a NumPy array of shape (T, F) for one channel, or (T, F, C) for multiple
-  cube channels.
-- `meta` is a `specscout.core.FrameMeta`.
-
-Units / "data space"
---------------------
-The dataset itself does not apply unit conversions (e.g., safe dB). If you want
-dB, z-scores, or compressed outputs, encode that as steps in `pipe`.
-
+Notes
+-----
+The dataset itself does not perform unit conversions or feature engineering.
+Such transformations should be supplied via the optional preprocessing pipeline.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Iterator, Optional, Sequence, Tuple, Union
+from pathlib import Path
+from typing import Iterator, Optional, Sequence
 
 import numpy as np
 
@@ -39,7 +35,7 @@ from .patches import PatchSpec, open_cube, read_patch
 from .preprocess import PreprocessPipeline
 
 Array = np.ndarray
-MaybeChans = Union[int, Tuple[int, ...]]
+MaybeChans = int | tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -54,7 +50,8 @@ class FrameMeta:
     t_end_idx
         End sample index (exclusive) in the cube.
     frame_idx
-        Frame number within the requested sequence (0..n_frames-1).
+        Frame number within the requested sequence (0..n_frames-1), or -1 if
+        the patch is not associated with a dataset index.
     start_time_utc
         UTC datetime corresponding to `t_start_idx`.
     dt_s
@@ -109,10 +106,9 @@ def plan_frames(
     stop_utc: str,
     window_seconds: float,
     step_seconds: float,
-    parse_utc,  # use your existing parse_utc in core
 ) -> FramePlan:
     """
-    Build a `FramePlan` from human-friendly UTC strings and durations.
+    Build a `FramePlan` from UTC strings and sliding-window durations.
 
     Parameters
     ----------
@@ -123,11 +119,9 @@ def plan_frames(
     dt_s
         Cadence in seconds per sample.
     start_utc, stop_utc
-        UTC strings in format YYYYmmdd_HHMMSS.
+        UTC strings in format ``YYYYmmdd_HHMMSS``.
     window_seconds, step_seconds
         Window length and step size in seconds.
-    parse_utc
-        Callable that parses UTC strings to timezone-aware datetimes.
 
     Returns
     -------
@@ -136,6 +130,8 @@ def plan_frames(
     """
     if window_seconds <= 0 or step_seconds <= 0:
         raise ValueError("window_seconds and step_seconds must be positive.")
+    if dt_s <= 0:
+        raise ValueError("dt_s must be positive.")
 
     window_n = seconds_to_samples(dt_s, window_seconds, min_n=1)
     step_n = seconds_to_samples(dt_s, step_seconds, min_n=1)
@@ -143,7 +139,7 @@ def plan_frames(
     start_dt = parse_utc(start_utc)
     stop_dt = parse_utc(stop_utc)
     if stop_dt < start_dt:
-        raise ValueError("stop_utc must be >= start_utc")
+        raise ValueError("stop_utc must be >= start_utc.")
 
     i_start = clamp_int(time_index(start_dt.timestamp(), t0_unix_s, dt_s), 0, nt)
     i_stop = clamp_int(time_index(stop_dt.timestamp(), t0_unix_s, dt_s), 0, nt)
@@ -168,22 +164,18 @@ def plan_frames(
 @dataclass(frozen=True)
 class DatasetPlan:
     """
-    A compact description of how a dataset iterates over a cube.
-
-    This is a thin wrapper around `specscout.core.FramePlan`, included so the
-    dataset can expose a stable, dataset-specific plan object if you want to
-    extend it later (e.g. stratified sampling, masks, etc.).
+    Compact description of how a dataset iterates over a cube.
 
     Attributes
     ----------
     frame_plan
-        The underlying `FramePlan` (indices + window/step in samples).
+        Underlying frame plan (indices + window/step in samples).
     f_start
         First frequency channel index (inclusive).
     f_stop
         Stop frequency channel index (exclusive).
     chans
-        Cube channels used by this dataset (e.g. (0,), (0,1,2)).
+        Cube channels used by this dataset (e.g. ``(0,)``, ``(0, 1)``).
     """
 
     frame_plan: FramePlan
@@ -192,7 +184,7 @@ class DatasetPlan:
     chans: tuple[int, ...]
 
 
-class SpecscoutDataset(Sequence[tuple[Array, FrameMeta]]):
+class SpecscoutDataset(Sequence):
     """
     Lazy, indexable dataset of rolling-window patches from a specscout Zarr cube.
 
@@ -202,39 +194,39 @@ class SpecscoutDataset(Sequence[tuple[Array, FrameMeta]]):
         Path to the specscout Zarr store directory.
     start_utc, stop_utc
         UTC timestamps (``YYYYmmdd_HHMMSS``) defining the dataset time span.
-        Windows are generated such that `[t_start, t_start + window)` stays in-bounds.
+        Windows are generated such that `[t_start, t_start + window)` stays
+        in-bounds.
     window_seconds, step_seconds
-        Window length and step size in seconds. These are converted once to samples
-        via `specscout.core.plan_frames`.
+        Window length and step size in seconds.
     chans
         Cube channel indices to include. If an int, it is treated as a 1-tuple.
-        - one channel -> samples have shape (T, F)
-        - multiple channels -> samples have shape (T, F, C)
+        - one channel -> samples have shape ``(T, F)``
+        - multiple channels -> samples have shape ``(T, F, C)``
     f_start, f_stop
-        Optional frequency slicing in *channel indices* (Python slice semantics).
+        Optional frequency slicing in channel indices (Python slice semantics).
         Defaults to full band.
     pipe
         Optional preprocessing pipeline applied to each patch after loading.
         The pipeline must conform to the standard specscout API:
-            `pipe(x, meta) -> x`
-        and is expected to encapsulate all conversions/whitening/clipping, etc.
+        ``pipe(x, meta) -> x``.
     dtype
-        dtype to cast loaded patches to (default float32).
+        Dtype to cast loaded patches to.
     return_meta
-        If True, `__getitem__` returns `(x, meta)`. If False, returns `x`.
+        If True, `__getitem__` returns ``(x, meta)``. If False, returns only
+        ``x``.
 
     Notes
     -----
     - The Zarr store is opened once in the constructor.
     - Each `__getitem__` reads only the required patch from disk.
-    - The dataset assumes the cube values are in "linear" space on read; if your
-      pipeline expects something else, set the pipeline's `input_space` accordingly
-      (or include a step like `step_safe_db` in the pipeline).
+    - The dataset assumes the cube values are in linear space on read; if your
+      pipeline expects something else, set the pipeline's `input_space`
+      accordingly or include a step such as `step_safe_db`.
     """
 
     def __init__(
         self,
-        zarr_path: str,
+        zarr_path: str | Path,
         *,
         start_utc: str,
         stop_utc: str,
@@ -256,22 +248,21 @@ class SpecscoutDataset(Sequence[tuple[Array, FrameMeta]]):
         self._dt_s = float(attrs["dt_seconds"])
         self._t0_unix_s = float(attrs["t0_unix_seconds"])
 
-        # Normalize chans
         if isinstance(chans, int):
             chans = (chans,)
         chans = tuple(int(c) for c in chans)
         if len(chans) == 0:
             raise ValueError("chans must contain at least one channel index.")
         if any((c < 0 or c >= nchan_total) for c in chans):
-            raise ValueError(f"chans out of bounds for cube with nchan={nchan_total}.")
+            raise ValueError(
+                f"chans out of bounds for cube with nchan={nchan_total}."
+            )
 
-        # Normalize freq slice
         if f_stop is None:
             f_stop = nfreq
         if not (0 <= f_start < f_stop <= nfreq):
             raise ValueError("Invalid frequency slice f_start/f_stop.")
 
-        # Compute *once*: indices + window_n + step_n
         frame_plan = plan_frames(
             nt=nt,
             t0_unix_s=self._t0_unix_s,
@@ -280,10 +271,8 @@ class SpecscoutDataset(Sequence[tuple[Array, FrameMeta]]):
             stop_utc=stop_utc,
             window_seconds=window_seconds,
             step_seconds=step_seconds,
-            parse_utc=parse_utc,
         )
 
-        # PatchSpec uses samples; reuse plan.window_n/plan.step_n (no duplication)
         self._spec = PatchSpec(
             window_n=frame_plan.window_n,
             step_n=frame_plan.step_n,
@@ -304,26 +293,16 @@ class SpecscoutDataset(Sequence[tuple[Array, FrameMeta]]):
         self._return_meta = bool(return_meta)
 
     @property
-    def attrs(self) -> dict:
+    def attrs(self) -> dict[str, object]:
         """
         Zarr group attributes as a plain dict.
-
-        Returns
-        -------
-        dict
-            A shallow copy of the Zarr attributes for this store.
         """
         return dict(self._attrs)
 
     @property
     def plan(self) -> DatasetPlan:
         """
-        The dataset plan (frame indices, window/step in samples, and channel selection).
-
-        Returns
-        -------
-        DatasetPlan
-            Stable description of dataset iteration and cube slicing.
+        Stable description of dataset iteration and cube slicing.
         """
         return self._plan
 
@@ -331,66 +310,38 @@ class SpecscoutDataset(Sequence[tuple[Array, FrameMeta]]):
     def dt_s(self) -> float:
         """
         Cadence in seconds per sample.
-
-        Returns
-        -------
-        float
-            The data cadence (seconds per time sample).
         """
         return self._dt_s
 
     @property
     def pipe(self) -> Optional[PreprocessPipeline]:
         """
-        The preprocessing pipeline applied to each example (if any).
-
-        Notes
-        -----
-        This is the canonical preprocessing hook across the project. The dataset
-        itself does not perform unit conversions; all such logic should live in
-        the pipeline steps.
+        Preprocessing pipeline applied to each example, if any.
         """
         return self._pipe
 
     def freq_axis(self) -> tuple[np.ndarray, str]:
         """
-        Return the frequency axis and its label for this dataset.
+        Return the frequency axis and its label for this dataset slice.
 
         Returns
         -------
         freqs, x_label
-            freqs
-                Frequency axis array of shape (nfreq_total,).
-            x_label
-                "Frequency (MHz)" if df_mhz is present, else "Frequency channel".
+            `freqs` has length `f_stop - f_start`.
         """
-        _nt, nfreq, _nchan = self._cube.shape
-        return freq_axis_from_attrs(self._attrs, nfreq)
+        _nt, nfreq_total, _nchan = self._cube.shape
+        freqs, x_label = freq_axis_from_attrs(self._attrs, nfreq_total)
+        return freqs[self._plan.f_start : self._plan.f_stop], x_label
 
     def __len__(self) -> int:
         """
         Number of examples/windows in the dataset.
-
-        Returns
-        -------
-        int
-            Total number of frames in the planned time range.
         """
         return int(self._plan.frame_plan.n_frames)
 
     def _frame_start_idx(self, idx: int) -> int:
         """
         Map dataset index -> cube start sample index.
-
-        Parameters
-        ----------
-        idx
-            Dataset index.
-
-        Returns
-        -------
-        int
-            Start sample index in the underlying cube.
 
         Raises
         ------
@@ -404,18 +355,7 @@ class SpecscoutDataset(Sequence[tuple[Array, FrameMeta]]):
 
     def _meta_for(self, idx: int) -> FrameMeta:
         """
-        Construct FrameMeta without reading any data.
-
-        Parameters
-        ----------
-        idx
-            Dataset index (0 <= idx < len(self)).
-
-        Returns
-        -------
-        FrameMeta
-            Metadata for that frame. The UTC start time is computed from the
-            dataset time axis.
+        Construct `FrameMeta` for a planned dataset frame without reading data.
         """
         fp = self._plan.frame_plan
         t_start_idx = self._frame_start_idx(idx)
@@ -438,11 +378,11 @@ class SpecscoutDataset(Sequence[tuple[Array, FrameMeta]]):
         dtype: Optional[np.dtype] = None,
     ):
         """
-        Load a patch by an explicit cube start index (`t_start_idx`).
+        Load a patch by an explicit cube start index.
 
-        This is the preferred entry point for "out-of-band" visualization and
-        outlier tooling, where you have a `FrameMeta` (or just a start index)
-        but not necessarily the dataset index.
+        This is the preferred entry point for visualization and outlier tooling
+        where you have a `FrameMeta` (or just a start index) but not necessarily
+        a dataset index.
 
         Parameters
         ----------
@@ -458,17 +398,16 @@ class SpecscoutDataset(Sequence[tuple[Array, FrameMeta]]):
             If None, uses the dataset default.
         dtype
             Optional dtype override for the read (and thus the pipeline input).
-            If None, uses the dataset dtype.
 
         Returns
         -------
         (x, meta) or x
-            If meta is requested, returns `(x, meta)`; otherwise returns `x`.
+            If metadata is requested, returns `(x, meta)`; otherwise returns `x`.
 
         Notes
         -----
-        - This does not require `t_start_idx` to correspond to one of the planned
-          dataset frames; it simply reads `window_n` samples starting there.
+        - This does not require `t_start_idx` to correspond to one of the
+          planned dataset frames.
         - Bounds behavior is determined by `specscout.patches.read_patch`.
         """
         t_start_idx_i = int(t_start_idx)
@@ -495,10 +434,7 @@ class SpecscoutDataset(Sequence[tuple[Array, FrameMeta]]):
         if apply_pipe and self._pipe is not None:
             x = self._pipe(x, meta)
 
-        if return_meta is None:
-            return_meta_flag = self._return_meta
-        else:
-            return_meta_flag = bool(return_meta)
+        return_meta_flag = self._return_meta if return_meta is None else bool(return_meta)
 
         if return_meta_flag:
             return x, meta
@@ -508,54 +444,21 @@ class SpecscoutDataset(Sequence[tuple[Array, FrameMeta]]):
         """
         Load one dataset example by dataset index.
 
-        Parameters
-        ----------
-        idx
-            Dataset index.
-
         Returns
         -------
         (x, meta) or x
             If `return_meta=True`, returns `(x, meta)`. Otherwise returns `x`.
-
-        Notes
-        -----
-        `x` has shape:
-        - (T, F) if one cube channel was requested
-        - (T, F, C) if multiple cube channels were requested
-
-        Preprocessing
-        -------------
-        If `pipe` is provided, it is applied after loading the patch and creating
-        `FrameMeta`. The dataset itself does not do any unit conversions.
         """
         idx_i = int(idx)
         t_start_idx = self._frame_start_idx(idx_i)
-        fp = self._plan.frame_plan
 
-        patch = read_patch(
-            self._cube,
-            self._time_axis,
-            self._spec,
-            t_start_idx=t_start_idx,
+        return self.load_by_t_start_idx(
+            t_start_idx,
+            frame_idx=idx_i,
+            apply_pipe=True,
+            return_meta=self._return_meta,
             dtype=self._dtype,
         )
-        x = patch.data
-
-        meta = FrameMeta(
-            t_start_idx=t_start_idx,
-            t_end_idx=t_start_idx + fp.window_n,
-            frame_idx=idx_i,
-            start_time_utc=patch.start_time_utc,
-            dt_s=fp.dt_s,
-        )
-
-        if self._pipe is not None:
-            x = self._pipe(x, meta)
-
-        if self._return_meta:
-            return x, meta
-        return x
 
     def iter(self) -> Iterator[tuple[Array, FrameMeta]]:
         """
@@ -564,7 +467,7 @@ class SpecscoutDataset(Sequence[tuple[Array, FrameMeta]]):
         Yields
         ------
         x, meta
-            Each example plus metadata (always yields meta regardless of
+            Each example plus metadata (always yields metadata regardless of
             `return_meta`).
         """
         for i in range(len(self)):
@@ -599,6 +502,7 @@ class SpecscoutDataset(Sequence[tuple[Array, FrameMeta]]):
         """
         if rng is None:
             rng = np.random.default_rng()
+
         i = int(rng.integers(0, len(self)))
 
         if return_meta is None:
@@ -610,9 +514,9 @@ class SpecscoutDataset(Sequence[tuple[Array, FrameMeta]]):
             x = self[i]
             return x, self._meta_for(i)
 
-        # return_meta=False
         if self._return_meta:
-            return self[i][0]
+            x, _ = self[i]
+            return x
         return self[i]
 
     def to_numpy_batch(
@@ -630,20 +534,16 @@ class SpecscoutDataset(Sequence[tuple[Array, FrameMeta]]):
         indices
             Sequence of dataset indices to load.
         return_meta
-            If True, also return a list of `FrameMeta` objects (one per sample).
+            If True, also return a list of `FrameMeta` objects.
         dtype
             If provided, cast the final stacked batch to this dtype.
 
         Returns
         -------
         batch
-            Array of shape (B, T, F) or (B, T, F, C).
+            Array of shape `(B, T, F)` or `(B, T, F, C)`.
         metas
-            Only returned if `return_meta=True`. List of length B.
-
-        Notes
-        -----
-        Any preprocessing is applied per-example via `pipe` before stacking.
+            Only returned if `return_meta=True`.
         """
         xs: list[np.ndarray] = []
         metas: list[FrameMeta] = []
