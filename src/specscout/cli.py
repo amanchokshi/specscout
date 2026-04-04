@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Any
 
 import zarr
 
@@ -21,6 +22,128 @@ def _build_default_out_path(
 ) -> Path:
     stem = f"{station}_{startutc}_{stoputc}".replace(":", "-")
     return Path.cwd() / f"{stem}.zarr"
+
+
+def _add_metric_args(
+    parser: argparse.ArgumentParser,
+    *,
+    prefix: str,
+    default_method: str,
+    include_positive_only: bool = False,
+    include_min_finite_frac: bool = False,
+) -> None:
+    """
+    Add metric-related argparse options to a parser.
+
+    Parameters
+    ----------
+    parser
+        Parser or argument group to modify.
+    prefix
+        Prefix for argument names, e.g. ``"quiet"`` or ``"score"``.
+    default_method
+        Default metric method string.
+    include_positive_only
+        If True, add a toggle for positive-only scoring.
+    include_min_finite_frac
+        If True, add ``min_finite_frac``.
+    """
+    parser.add_argument(
+        f"--{prefix}-method",
+        type=str,
+        default=default_method,
+        choices=[
+            "p99",
+            "p995",
+            "p999",
+            "percentile",
+            "topk_sum",
+            "excess_mass",
+            "l1",
+            "l2",
+            "lp",
+        ],
+        help=f"{prefix.capitalize()} metric method.",
+    )
+    parser.add_argument(
+        f"--{prefix}-q",
+        type=float,
+        default=99.0,
+        help=f"Percentile q used when --{prefix}-method=percentile.",
+    )
+    parser.add_argument(
+        f"--{prefix}-topk",
+        type=int,
+        default=2048,
+        help=f"Top-k used when --{prefix}-method=topk_sum.",
+    )
+    parser.add_argument(
+        f"--{prefix}-thr",
+        type=float,
+        default=3.0,
+        help=f"Threshold used when --{prefix}-method=excess_mass.",
+    )
+    parser.add_argument(
+        f"--{prefix}-p",
+        type=float,
+        default=4.0,
+        help=f"p used when --{prefix}-method=lp.",
+    )
+
+    if include_positive_only:
+        group = parser.add_mutually_exclusive_group()
+        group.add_argument(
+            f"--{prefix}-positive-only",
+            dest=f"{prefix}_positive_only",
+            action="store_true",
+            help=f"Score only positive residuals for {prefix}.",
+        )
+        group.add_argument(
+            f"--{prefix}-allow-negative",
+            dest=f"{prefix}_positive_only",
+            action="store_false",
+            help=f"Allow negative residuals to contribute to {prefix}.",
+        )
+        parser.set_defaults(**{f"{prefix}_positive_only": True})
+
+    if include_min_finite_frac:
+        parser.add_argument(
+            f"--{prefix}-min-finite-frac",
+            type=float,
+            default=0.7,
+            help=f"Minimum finite fraction required for {prefix} scoring.",
+        )
+
+
+def _build_metric_kwargs(
+    *,
+    args: argparse.Namespace,
+    prefix: str,
+    include_positive_only: bool = False,
+    include_min_finite_frac: bool = False,
+) -> dict[str, Any]:
+    """
+    Build a kwargs dict for metric-based configuration from argparse args.
+    """
+    method = getattr(args, f"{prefix}_method")
+    kwargs: dict[str, Any] = {"method": method}
+
+    if method == "percentile":
+        kwargs["q"] = getattr(args, f"{prefix}_q")
+    elif method == "topk_sum":
+        kwargs["topk"] = getattr(args, f"{prefix}_topk")
+    elif method == "excess_mass":
+        kwargs["thr"] = getattr(args, f"{prefix}_thr")
+    elif method == "lp":
+        kwargs["p"] = getattr(args, f"{prefix}_p")
+
+    if include_positive_only:
+        kwargs["positive_only"] = getattr(args, f"{prefix}_positive_only")
+
+    if include_min_finite_frac:
+        kwargs["min_finite_frac"] = getattr(args, f"{prefix}_min_finite_frac")
+
+    return kwargs
 
 
 def ingest_cmd(args: argparse.Namespace) -> None:
@@ -69,6 +192,20 @@ def ingest_cmd(args: argparse.Namespace) -> None:
 
 
 def roi_search_cmd(args: argparse.Namespace) -> None:
+    quiet_selector_kwargs = _build_metric_kwargs(
+        args=args,
+        prefix="quiet",
+        include_positive_only=False,
+        include_min_finite_frac=False,
+    )
+
+    score_kwargs = _build_metric_kwargs(
+        args=args,
+        prefix="score",
+        include_positive_only=True,
+        include_min_finite_frac=True,
+    )
+
     result = run_roi_search(
         args.zarr_path,
         station=args.station,
@@ -85,13 +222,15 @@ def roi_search_cmd(args: argparse.Namespace) -> None:
         n_quiet=args.n_quiet,
         k_fit=args.k_fit,
         k_pca=args.k_pca,
-        min_finite_frac=args.min_finite_frac,
+        min_finite_frac=args.score_min_finite_frac,
         nsig=args.nsig,
         pad_minutes=args.pad_minutes,
         merge_gap_minutes=args.merge_gap_minutes,
         rfi_mask_start=args.rfi_mask_start,
         rfi_mask_stop=args.rfi_mask_stop,
         random_state=args.random_state,
+        quiet_selector_kwargs=quiet_selector_kwargs,
+        score_kwargs=score_kwargs,
     )
 
     print("ROI search complete.")
@@ -143,6 +282,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="specscout",
         description="Specscout command line tools.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -150,6 +290,7 @@ def build_parser() -> argparse.ArgumentParser:
     ingest = subparsers.add_parser(
         "ingest",
         help="Ingest ALBATROS direct spectra into a Zarr cube.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ingest.add_argument(
         "root",
@@ -191,11 +332,12 @@ def build_parser() -> argparse.ArgumentParser:
     zmeta = subparsers.add_parser(
         "zarrmeta",
         help="Print metadata from a specscout Zarr store.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     zmeta.add_argument(
         "path",
         type=Path,
-        help="Path to .zarr directory",
+        help="Path to .zarr directory.",
     )
     zmeta.add_argument(
         "--all",
@@ -208,6 +350,7 @@ def build_parser() -> argparse.ArgumentParser:
     roi = subparsers.add_parser(
         "roi-search",
         help="Run rolling PCA ROI search on a station-season Zarr product.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     roi.add_argument(
         "zarr_path",
@@ -236,30 +379,124 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output directory for scores, ROIs, config, and plots.",
     )
 
-    roi.add_argument("--window-minutes", type=float, default=20.0)
-    roi.add_argument("--step-minutes", type=float, default=5.0)
+    roi.add_argument(
+        "--window-minutes",
+        type=float,
+        default=20.0,
+        help="Frame duration in minutes.",
+    )
+    roi.add_argument(
+        "--step-minutes",
+        type=float,
+        default=5.0,
+        help="Frame step size in minutes.",
+    )
 
-    roi.add_argument("--context-hours", type=float, default=24.0)
-    roi.add_argument("--stride-hours", type=float, default=1.0)
-    roi.add_argument("--score-hours", type=float, default=1.0)
-    roi.add_argument("--gap-hours", type=float, default=0.0)
+    roi.add_argument(
+        "--context-hours",
+        type=float,
+        default=24.0,
+        help="Rolling PCA context window width in hours.",
+    )
+    roi.add_argument(
+        "--stride-hours",
+        type=float,
+        default=1.0,
+        help="How often to refit and rescore, in hours.",
+    )
+    roi.add_argument(
+        "--score-hours",
+        type=float,
+        default=1.0,
+        help="Width of scored chunk per rolling step, in hours.",
+    )
+    roi.add_argument(
+        "--gap-hours",
+        type=float,
+        default=0.0,
+        help="Optional donut gap around the scored interval when fitting PCA, in hours.",
+    )
 
-    roi.add_argument("--quiet-fraction", type=float, default=0.3)
-    roi.add_argument("--n-quiet", type=int, default=None)
+    roi.add_argument(
+        "--quiet-fraction",
+        type=float,
+        default=0.3,
+        help="Default fraction of context frames retained for quiet PCA training.",
+    )
+    roi.add_argument(
+        "--n-quiet",
+        type=int,
+        default=None,
+        help="Optional fixed number of quiet frames. Overrides quiet_fraction in the rolling runner.",
+    )
 
-    roi.add_argument("--k-fit", type=int, default=128)
-    roi.add_argument("--k-pca", type=int, default=16)
+    _add_metric_args(
+        roi,
+        prefix="quiet",
+        default_method="p99",
+        include_positive_only=False,
+        include_min_finite_frac=False,
+    )
 
-    roi.add_argument("--min-finite-frac", type=float, default=0.7)
+    _add_metric_args(
+        roi,
+        prefix="score",
+        default_method="p99",
+        include_positive_only=True,
+        include_min_finite_frac=True,
+    )
 
-    roi.add_argument("--nsig", type=float, default=3.0)
-    roi.add_argument("--pad-minutes", type=float, default=5.0)
-    roi.add_argument("--merge-gap-minutes", type=float, default=20.0)
+    roi.add_argument(
+        "--k-fit",
+        type=int,
+        default=128,
+        help="Number of PCA modes fit in the quiet background model.",
+    )
+    roi.add_argument(
+        "--k-pca",
+        type=int,
+        default=16,
+        help="Number of PCA modes used during reconstruction for scoring.",
+    )
 
-    roi.add_argument("--rfi-mask-start", type=int, default=116)
-    roi.add_argument("--rfi-mask-stop", type=int, default=384)
+    roi.add_argument(
+        "--nsig",
+        type=float,
+        default=3.0,
+        help="Robust sigma threshold multiplier for ROI detection.",
+    )
+    roi.add_argument(
+        "--pad-minutes",
+        type=float,
+        default=5.0,
+        help="Padding applied to each ROI boundary, in minutes.",
+    )
+    roi.add_argument(
+        "--merge-gap-minutes",
+        type=float,
+        default=20.0,
+        help="Merge ROIs separated by less than or equal to this gap, in minutes.",
+    )
 
-    roi.add_argument("--random-state", type=int, default=42)
+    roi.add_argument(
+        "--rfi-mask-start",
+        type=int,
+        default=116,
+        help="Start channel of the masked RFI range.",
+    )
+    roi.add_argument(
+        "--rfi-mask-stop",
+        type=int,
+        default=384,
+        help="Stop channel of the masked RFI range.",
+    )
+
+    roi.add_argument(
+        "--random-state",
+        type=int,
+        default=42,
+        help="Random seed for randomized SVD.",
+    )
 
     roi.set_defaults(func=roi_search_cmd)
 
