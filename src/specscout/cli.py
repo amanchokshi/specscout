@@ -11,7 +11,8 @@ from .ingest import (
     infer_available_utc_bounds,
     ingest_direct_spectra_to_zarr,
 )
-from .roi_search import run_roi_search
+from .preprocess import PreprocessPipeline, step_safe_db, step_stokes_i
+from .roi import run_roi_search
 
 
 def _build_default_out_path(
@@ -22,6 +23,33 @@ def _build_default_out_path(
 ) -> Path:
     stem = f"{station}_{startutc}_{stoputc}".replace(":", "-")
     return Path.cwd() / f"{stem}.zarr"
+
+
+def _build_default_stokes_i_pipe(
+    *,
+    zarr_path: str | Path | None = None,
+    station: str | None = None,
+    notes: str | None = None,
+) -> PreprocessPipeline:
+    """
+    Build the default Stokes-I + safe_db preprocessing pipeline used by the CLI.
+
+    This is the standard operational detection/plotting product for roi-search.
+    """
+    pipe = PreprocessPipeline(input_space="linear")
+    md: dict[str, Any] = {}
+
+    if zarr_path is not None:
+        md["zarr_path"] = str(zarr_path)
+    if station is not None:
+        md["station"] = station
+    if notes is not None:
+        md["notes"] = notes
+
+    if md:
+        pipe = pipe.with_metadata(**md)
+
+    return pipe.add(step_stokes_i()).add(step_safe_db(name="safe_db"))
 
 
 def _add_metric_args(
@@ -198,6 +226,7 @@ def roi_search_cmd(args: argparse.Namespace) -> None:
         include_positive_only=False,
         include_min_finite_frac=False,
     )
+    quiet_selector_kwargs["quiet_fraction"] = args.quiet_fraction
 
     score_kwargs = _build_metric_kwargs(
         args=args,
@@ -206,23 +235,36 @@ def roi_search_cmd(args: argparse.Namespace) -> None:
         include_min_finite_frac=True,
     )
 
+    detect_pipe = _build_default_stokes_i_pipe(
+        zarr_path=args.zarr_path,
+        station=args.station,
+        notes="CLI default detection pipe: Stokes I + safe_db",
+    )
+    plot_pipe = _build_default_stokes_i_pipe(
+        zarr_path=args.zarr_path,
+        station=args.station,
+        notes="CLI default plotting pipe: Stokes I + safe_db",
+    )
+
     result = run_roi_search(
         args.zarr_path,
         station=args.station,
         analysis_start_utc=args.startutc,
         analysis_stop_utc=args.stoputc,
         out_dir=args.out_dir,
+        detect_chans=(0, 1),
+        detect_pipe=detect_pipe,
+        plot_chans=(0, 1),
+        plot_pipe=plot_pipe,
         window_seconds=args.window_minutes * 60.0,
         step_seconds=args.step_minutes * 60.0,
         context_hours=args.context_hours,
         stride_hours=args.stride_hours,
         score_hours=args.score_hours,
         gap_hours=args.gap_hours,
-        quiet_fraction=args.quiet_fraction,
         n_quiet=args.n_quiet,
         k_fit=args.k_fit,
         k_pca=args.k_pca,
-        min_finite_frac=args.score_min_finite_frac,
         nsig=args.nsig,
         pad_minutes=args.pad_minutes,
         merge_gap_minutes=args.merge_gap_minutes,
@@ -231,6 +273,8 @@ def roi_search_cmd(args: argparse.Namespace) -> None:
         random_state=args.random_state,
         quiet_selector_kwargs=quiet_selector_kwargs,
         score_kwargs=score_kwargs,
+        plot_pad_minutes=args.plot_pad_minutes,
+        save_plots=not args.no_plots,
     )
 
     print("ROI search complete.")
@@ -286,7 +330,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # ingest
     ingest = subparsers.add_parser(
         "ingest",
         help="Ingest ALBATROS direct spectra into a Zarr cube.",
@@ -328,7 +371,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ingest.set_defaults(func=ingest_cmd)
 
-    # zarrmeta
     zmeta = subparsers.add_parser(
         "zarrmeta",
         help="Print metadata from a specscout Zarr store.",
@@ -346,7 +388,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     zmeta.set_defaults(func=zarrmeta_cmd)
 
-    # roi-search
     roi = subparsers.add_parser(
         "roi-search",
         help="Run rolling PCA ROI search on a station-season Zarr product.",
@@ -391,7 +432,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=5.0,
         help="Frame step size in minutes.",
     )
-
     roi.add_argument(
         "--context-hours",
         type=float,
@@ -421,7 +461,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--quiet-fraction",
         type=float,
         default=0.3,
-        help="Default fraction of context frames retained for quiet PCA training.",
+        help="Fraction of finite-scored context frames retained for quiet PCA training.",
     )
     roi.add_argument(
         "--n-quiet",
@@ -458,7 +498,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=16,
         help="Number of PCA modes used during reconstruction for scoring.",
     )
-
     roi.add_argument(
         "--nsig",
         type=float,
@@ -477,7 +516,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=20.0,
         help="Merge ROIs separated by less than or equal to this gap, in minutes.",
     )
-
     roi.add_argument(
         "--rfi-mask-start",
         type=int,
@@ -490,12 +528,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=384,
         help="Stop channel of the masked RFI range.",
     )
-
     roi.add_argument(
         "--random-state",
         type=int,
         default=42,
         help="Random seed for randomized SVD.",
+    )
+    roi.add_argument(
+        "--plot-pad-minutes",
+        type=float,
+        default=5.0,
+        help="Extra context shown on either side of each ROI in ROI quicklook plots.",
+    )
+    roi.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="Do not generate summary or ROI quicklook plots.",
     )
 
     roi.set_defaults(func=roi_search_cmd)
