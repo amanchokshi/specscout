@@ -540,17 +540,52 @@ class RollingPCARunner:
 
                 # Quiet selection
                 quiet_scores = qs.scores(ctx_frames_fit)
-                order = np.argsort(quiet_scores)  # lower = quieter
+
+                # Only keep frames with finite quietness scores as PCA candidates
+                valid_quiet = np.isfinite(quiet_scores)
+                if not np.any(valid_quiet):
+                    next_h_idx += 1
+                    continue
+
+                ctx_frames_quiet = ctx_frames_fit[valid_quiet]
+                quiet_scores_valid = quiet_scores[valid_quiet]
+
+                order = np.argsort(quiet_scores_valid)  # lower = quieter
                 if self.n_quiet is not None:
                     nq = int(max(1, min(int(self.n_quiet), order.size)))
                 else:
                     qf = float(qs.quiet_fraction)
                     nq = int(max(1, np.floor(qf * order.size)))
+
                 quiet_idx = order[:nq]
-                quiet_frames = ctx_frames_fit[quiet_idx]
+                quiet_frames = ctx_frames_quiet[quiet_idx]
+
+                # Final guard: PCA fit requires fully finite frames after masking
+                Xq = bg._prep(quiet_frames)
+                ok_fit = np.isfinite(Xq).all(axis=1)
+                if not np.any(ok_fit):
+                    next_h_idx += 1
+                    continue
+
+                quiet_frames = quiet_frames[ok_fit]
+                nq = int(quiet_frames.shape[0])
 
                 # Fit PCA
                 bg.fit(quiet_frames)
+
+                # # Quiet selection
+                # quiet_scores = qs.scores(ctx_frames_fit)
+                # order = np.argsort(quiet_scores)  # lower = quieter
+                # if self.n_quiet is not None:
+                #     nq = int(max(1, min(int(self.n_quiet), order.size)))
+                # else:
+                #     qf = float(qs.quiet_fraction)
+                #     nq = int(max(1, np.floor(qf * order.size)))
+                # quiet_idx = order[:nq]
+                # quiet_frames = ctx_frames_fit[quiet_idx]
+                #
+                # # Fit PCA
+                # bg.fit(quiet_frames)
 
                 # Score hour
                 hour_frames, hour_metas_any = buf.select_time_range(start=hour_start, stop=hour_stop)
