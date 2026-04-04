@@ -204,32 +204,6 @@ def freq_axis_from_attrs(attrs: dict, nfreq: int) -> tuple[np.ndarray, str]:
     return f0 + df * np.arange(nfreq, dtype=float), "Frequency (MHz)"
 
 
-def safe_db(x: np.ndarray, floor: float = 1e-12) -> np.ndarray:
-    """
-    Convert linear power-like values to dB safely: ``10 * log10(x)``.
-
-    This helper is designed for arrays that may contain NaNs and zeros.
-
-    Parameters
-    ----------
-    x
-        Input array. NaNs are preserved. Finite values are floored to `floor`
-        before applying log10, to avoid ``-inf`` from zeros.
-    floor
-        Minimum finite value used before log conversion.
-
-    Returns
-    -------
-    numpy.ndarray
-        Array of the same shape as `x`, dtype float (numpy chooses),
-        containing dB values.
-    """
-    with np.errstate(divide="ignore", invalid="ignore"):
-        x2 = np.array(x, copy=True)
-        finite = np.isfinite(x2)
-        x2[finite] = np.maximum(x2[finite], floor)
-        return 10.0 * np.log10(x2)
-
 
 def plan_frames(
     *,
