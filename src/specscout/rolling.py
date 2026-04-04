@@ -95,8 +95,8 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .core import FrameMeta, parse_utc
-from .dataset import SpecscoutDataset
+from .core import parse_utc
+from .dataset import SpecscoutDataset, FrameMeta
 from .outlier import QuietSelector, RollingPCABackground
 
 Array = np.ndarray

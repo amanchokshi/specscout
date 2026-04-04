@@ -48,7 +48,7 @@ from typing import Any, Callable, Iterable, Literal, Optional, Sequence
 
 import numpy as np
 
-from .core import FrameMeta
+from .dataset import FrameMeta
 
 Transform = Callable[[np.ndarray, FrameMeta], np.ndarray]
 DataSpace = Literal["linear", "db"]
