@@ -35,7 +35,7 @@ from .dataset import SpecscoutDataset
 from .outlier import QuietSelector, RollingPCABackground
 from .preprocess import PreprocessPipeline
 from .rolling import RollingPCARunner, padded_utc_range
-from .viz import plot_roi_event, plot_scores_with_rois
+from .viz.static import plot_roi_event, plot_scores_with_rois
 
 
 @dataclass(frozen=True)
