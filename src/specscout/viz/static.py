@@ -7,6 +7,7 @@ This module contains non-interactive Matplotlib helpers for:
 - plotting an arbitrary contiguous time range read directly from a Zarr store
 - plotting ROI summaries and ROI event quicklooks
 - saving sequential or arbitrary selected frames to PNG files
+- recipe-based diagnostic plots for common instrumental and Stokes products
 
 All plotting functions are compatible with preprocessing pipelines. In
 particular, they support:
@@ -25,6 +26,15 @@ Units / colorbar labeling
 Visualization functions do not take an explicit units argument. If a
 preprocessing pipeline is provided, colorbar labels are inferred from
 ``pipe.output_space``. Otherwise units are assumed to be ``"linear"``.
+
+Recipe plots may use mixed semantics across panels, for example:
+
+- ``stokes_I_dB``
+- ``Q/I``
+- ``U/I``
+- ``V/I``
+
+These recipe plots therefore support per-panel colorbar labels and colormaps.
 """
 
 from __future__ import annotations
@@ -56,6 +66,37 @@ def _infer_units(pipe: Optional[PreprocessPipeline]) -> str:
         return "linear"
     out_units = getattr(pipe, "output_space", None)
     return "linear" if out_units is None else str(out_units)
+
+
+def _centered_vlims_for_image(
+    img: np.ndarray,
+    *,
+    clim_percentiles: tuple[float, float],
+    vlims: tuple[float, float] | None,
+) -> tuple[float, float]:
+    """
+    Determine symmetric color limits around zero for one image.
+
+    When `vlims` is not provided, symmetric limits are estimated from finite
+    pixels using the larger absolute value of the requested lower/upper
+    percentiles. Fully non-finite images fall back to ``(-1, 1)``.
+    """
+    if vlims is not None:
+        return float(vlims[0]), float(vlims[1])
+
+    finite = np.isfinite(img)
+    if not np.any(finite):
+        return -1.0, 1.0
+
+    lo, hi = clim_percentiles
+    vlo = float(np.nanpercentile(img, lo))
+    vhi = float(np.nanpercentile(img, hi))
+    vmax = max(abs(vlo), abs(vhi))
+
+    if not np.isfinite(vmax) or vmax == 0.0:
+        return -1.0, 1.0
+
+    return -vmax, vmax
 
 
 def _vlims_for_image(
@@ -181,6 +222,26 @@ def _time_range_extent_from_frame(
     return [float(freqs[0]), float(freqs[-1]), t_seconds, 0.0]
 
 
+def _normalize_panel_arg(
+    value,
+    *,
+    n_panels: int,
+    name: str,
+):
+    """
+    Normalize a scalar-or-sequence plotting argument to a per-panel list.
+    """
+    if value is None:
+        return [None] * n_panels
+
+    if isinstance(value, (list, tuple)):
+        if len(value) != n_panels:
+            raise ValueError(f"{name} sequence must match number of panels.")
+        return list(value)
+
+    return [value] * n_panels
+
+
 def _load_frame_for_plot(
     ds: SpecscoutDataset,
     *,
@@ -228,7 +289,9 @@ def _plot_loaded_frame(
     channel_labels: Sequence[str] | None = None,
     cmap=cmr.pride,
     clim_percentiles: tuple[float, float] = (1.0, 99.0),
-    vlims: tuple[float, float] | None = None,
+    vlims=None,
+    cbar_units: str | Sequence[str] | None = None,
+    center_zero: bool | Sequence[bool] = False,
     figsize: tuple[float, float] = (8.5, 5.5),
     title: str | None = None,
 ) -> tuple[plt.Figure, np.ndarray]:
@@ -258,8 +321,9 @@ def _plot_loaded_frame(
         cmap=cmap,
         clim_percentiles=clim_percentiles,
         vlims=vlims,
+        cbar_units=cbar_units if cbar_units is not None else units,
+        center_zero=center_zero,
         figsize=figsize,
-        units=units,
         title=title,
     )
 
@@ -274,9 +338,10 @@ def _plot_waterfall_grid(
     channel_labels: Sequence[str] | None = None,
     cmap=cmr.pride,
     clim_percentiles: tuple[float, float] = (1.0, 99.0),
-    vlims: tuple[float, float] | None = None,
+    vlims=None,
+    cbar_units: str | Sequence[str] = "linear",
+    center_zero: bool | Sequence[bool] = False,
     figsize: tuple[float, float] = (8.5, 5.5),
-    units: str = "linear",
     title: str | None = None,
 ) -> tuple[plt.Figure, np.ndarray]:
     """
@@ -296,6 +361,19 @@ def _plot_waterfall_grid(
         Required when ``x_mode="timerange"``.
     channel_labels
         Optional labels for each panel.
+    cmap
+        Either a single colormap or a sequence of length `n_panels`.
+    clim_percentiles
+        Percentiles used when `vlims` is None.
+    vlims
+        Either None, a single `(vmin, vmax)` pair, or a sequence of per-panel
+        `(vmin, vmax)` pairs.
+    cbar_units
+        Either a single colorbar label or a sequence of per-panel labels.
+    center_zero
+        Either a single bool or a sequence of per-panel bools. When True for a
+        panel, color limits are chosen symmetrically around zero unless
+        overridden by an explicit `vlims`.
     """
     arr = np.asarray(data)
 
@@ -315,6 +393,19 @@ def _plot_waterfall_grid(
         channel_labels = list(channel_labels)
         if len(channel_labels) != n_panels:
             raise ValueError("channel_labels length does not match number of panels.")
+
+    cmaps = _normalize_panel_arg(cmap, n_panels=n_panels, name="cmap")
+    vlims_list = _normalize_panel_arg(vlims, n_panels=n_panels, name="vlims")
+    units_list = _normalize_panel_arg(
+        cbar_units,
+        n_panels=n_panels,
+        name="cbar_units",
+    )
+    center_zero_list = _normalize_panel_arg(
+        center_zero,
+        n_panels=n_panels,
+        name="center_zero",
+    )
 
     nrows, ncols = _panel_layout(n_panels)
     fig, axs = plt.subplots(
@@ -358,6 +449,10 @@ def _plot_waterfall_grid(
         ax = axs_flat[j]
         img = arr[:, :, j]
         panel_label = str(channel_labels[j])
+        panel_cmap = cmaps[j]
+        panel_vlims = vlims_list[j]
+        panel_units = units_list[j]
+        panel_center_zero = bool(center_zero_list[j])
 
         if x_mode == "frame":
             im = ax.imshow(
@@ -365,7 +460,7 @@ def _plot_waterfall_grid(
                 aspect="auto",
                 interpolation="none",
                 extent=extent,
-                cmap=cmap,
+                cmap=panel_cmap,
             )
             ax.set_xlabel("Frequency [MHz]")
             ax.set_ylabel("Time since start (s)")
@@ -375,7 +470,7 @@ def _plot_waterfall_grid(
                 y_edges,
                 img.T,
                 shading="auto",
-                cmap=cmap,
+                cmap=panel_cmap,
             )
             ax.set_xlabel("UTC time")
             ax.set_ylabel("Frequency [MHz]")
@@ -385,17 +480,24 @@ def _plot_waterfall_grid(
             ax.xaxis.set_major_locator(locator)
             ax.xaxis.set_major_formatter(formatter)
 
-        vmin, vmax = _vlims_for_image(
-            img,
-            clim_percentiles=clim_percentiles,
-            vlims=vlims,
-        )
-        im.set_clim(vmin, vmax)
+        if panel_center_zero:
+            vmin, vmax = _centered_vlims_for_image(
+                img,
+                clim_percentiles=clim_percentiles,
+                vlims=panel_vlims,
+            )
+        else:
+            vmin, vmax = _vlims_for_image(
+                img,
+                clim_percentiles=clim_percentiles,
+                vlims=panel_vlims,
+            )
 
+        im.set_clim(vmin, vmax)
         ax.set_title(panel_label)
 
         cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        cbar.set_label(units)
+        cbar.set_label("" if panel_units is None else str(panel_units))
 
     for j in range(n_panels, len(axs_flat)):
         axs_flat[j].set_axis_off()
@@ -416,7 +518,9 @@ def plot_frame(
     channel_labels: Sequence[str] | None = None,
     cmap=cmr.pride,
     clim_percentiles: tuple[float, float] = (1.0, 99.0),
-    vlims: tuple[float, float] | None = None,
+    vlims=None,
+    cbar_units: str | Sequence[str] | None = None,
+    center_zero: bool | Sequence[bool] = False,
     figsize: tuple[float, float] = (8.5, 5.5),
     title: str | None = None,
 ) -> tuple[plt.Figure, np.ndarray]:
@@ -424,34 +528,6 @@ def plot_frame(
     Plot a single dataset frame.
 
     Exactly one of `idx` or `meta` must be provided.
-
-    Parameters
-    ----------
-    ds
-        Dataset used to read the frame.
-    idx
-        Dataset frame index.
-    meta
-        Explicit FrameMeta identifying the frame to load.
-    pipe
-        Optional plotting pipeline applied after reading.
-    channel_labels
-        Optional labels for panel titles.
-    cmap
-        Colormap. Defaults to ``cmr.pride``.
-    clim_percentiles
-        Percentiles used for per-panel dynamic color scaling when `vlims` is None.
-    vlims
-        Optional fixed color limits.
-    figsize
-        Figure size in inches.
-    title
-        Optional figure title.
-
-    Returns
-    -------
-    fig, axs
-        Matplotlib figure and axes array.
     """
     data, loaded_meta = _load_frame_for_plot(ds, idx=idx, meta=meta, pipe=pipe)
     return _plot_loaded_frame(
@@ -463,6 +539,8 @@ def plot_frame(
         cmap=cmap,
         clim_percentiles=clim_percentiles,
         vlims=vlims,
+        cbar_units=cbar_units,
+        center_zero=center_zero,
         figsize=figsize,
         title=title,
     )
@@ -478,40 +556,14 @@ def plot_time_range(
     channel_labels: Sequence[str] | None = None,
     cmap=cmr.pride,
     clim_percentiles: tuple[float, float] = (1.0, 99.0),
-    vlims: tuple[float, float] | None = None,
+    vlims=None,
+    cbar_units: str | Sequence[str] | None = None,
+    center_zero: bool | Sequence[bool] = False,
     figsize: tuple[float, float] = (10.0, 5.5),
     title: str | None = None,
 ) -> tuple[plt.Figure, np.ndarray]:
     """
     Read an arbitrary contiguous time range from a Zarr store and plot it.
-
-    Parameters
-    ----------
-    zarr_path
-        Path to the specscout Zarr store.
-    start_utc, stop_utc
-        Inclusive / exclusive UTC bounds accepted by `read_time_range`.
-    chans
-        Raw cube channel selection.
-    pipe
-        Optional preprocessing pipeline applied after reading.
-    channel_labels
-        Optional labels for panel titles.
-    cmap
-        Colormap. Defaults to ``cmr.pride``.
-    clim_percentiles
-        Percentiles used for per-panel dynamic color scaling when `vlims` is None.
-    vlims
-        Optional fixed color limits.
-    figsize
-        Figure size in inches.
-    title
-        Optional figure title.
-
-    Returns
-    -------
-    fig, axs
-        Matplotlib figure and axes array.
     """
     data, times, _meta = read_time_range(
         zarr_path,
@@ -561,8 +613,9 @@ def plot_time_range(
         cmap=cmap,
         clim_percentiles=clim_percentiles,
         vlims=vlims,
+        cbar_units=cbar_units if cbar_units is not None else units,
+        center_zero=center_zero,
         figsize=figsize,
-        units=units,
         title=title,
     )
 
@@ -762,6 +815,374 @@ def plot_roi_event(
     return fig, axs
 
 
+def _reject_db_recipe_pipe(
+    pipe: PreprocessPipeline | None,
+    *,
+    func_name: str,
+    expected: str,
+) -> None:
+    """
+    Reject recipe plotting pipelines that already output dB-valued data.
+
+    Parameters
+    ----------
+    pipe
+        Optional preprocessing pipeline passed by the caller.
+    func_name
+        Public plotting function name for the error message.
+    expected
+        Short description of the expected input semantics.
+    """
+    if pipe is None:
+        return
+
+    out_space = getattr(pipe, "output_space", None)
+    if out_space == "db":
+        raise ValueError(
+            f"{func_name} expects {expected}, but received a pipeline with "
+            "output_space='db'. Pass raw linear inputs or a linear-valued "
+            "transform pipeline instead."
+        )
+
+
+def _build_instrumental_quicklook(
+    data: np.ndarray,
+) -> tuple[np.ndarray, list[str], list, list[str], list[bool]]:
+    """
+    Build instrumental mixed quicklook:
+
+    - pol00_dB
+    - pol11_dB
+    - pol01_mag_dB
+    - pol01_phase
+    """
+    x = np.asarray(data)
+    if x.ndim != 3 or x.shape[2] != 4:
+        raise ValueError("Instrumental quicklook requires data with shape (T, F, 4).")
+
+    pol00 = x[:, :, 0]
+    pol11 = x[:, :, 1]
+    pol01_mag = x[:, :, 2]
+    pol01_phase = x[:, :, 3]
+
+    eps = 1e-12
+
+    def _safe_db_local(arr: np.ndarray) -> np.ndarray:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            out = np.array(arr, copy=True, dtype=np.float32)
+            finite = np.isfinite(out)
+            out[finite] = np.maximum(out[finite], eps)
+            return 10.0 * np.log10(out)
+
+    out = np.stack(
+        [
+            _safe_db_local(pol00),
+            _safe_db_local(pol11),
+            _safe_db_local(pol01_mag),
+            np.asarray(pol01_phase, dtype=np.float32),
+        ],
+        axis=2,
+    )
+
+    labels = ["pol00_dB", "pol11_dB", "pol01_mag_dB", "pol01_phase"]
+    cmaps = [cmr.pride, cmr.pride, cmr.pride, "PuOr"]
+    units = ["db", "db", "db", "rad"]
+    center_zero = [False, False, False, False]
+
+    return out, labels, cmaps, units, center_zero
+
+
+def _build_stokes_fractional_quicklook(
+    data: np.ndarray,
+) -> tuple[np.ndarray, list[str], list, list[str], list[tuple[float, float] | None], list[bool]]:
+    """
+    Build Stokes diagnostic quicklook:
+
+    - stokes_I_dB
+    - Q/I
+    - U/I
+    - V/I
+    """
+    x = np.asarray(data)
+    if x.ndim != 3 or x.shape[2] != 4:
+        raise ValueError("Stokes fractional quicklook requires data with shape (T, F, 4).")
+
+    I = x[:, :, 0]
+    Q = x[:, :, 1]
+    U = x[:, :, 2]
+    V = x[:, :, 3]
+
+    eps = 1e-12
+    I_safe = np.where(np.abs(I) > eps, I, np.nan)
+
+    def _safe_db_local(arr: np.ndarray) -> np.ndarray:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            out = np.array(arr, copy=True, dtype=np.float32)
+            finite = np.isfinite(out)
+            out[finite] = np.maximum(out[finite], eps)
+            return 10.0 * np.log10(out)
+
+    out = np.stack(
+        [
+            _safe_db_local(I),
+            np.asarray(Q / I_safe, dtype=np.float32),
+            np.asarray(U / I_safe, dtype=np.float32),
+            np.asarray(V / I_safe, dtype=np.float32),
+        ],
+        axis=2,
+    )
+
+    labels = ["stokes_I_dB", "Q/I", "U/I", "V/I"]
+    cmaps = [cmr.pride, "PuOr", "PuOr", "PuOr"]
+    units = ["db", "ratio", "ratio", "ratio"]
+    vlims = [None, None, None, None]
+    center_zero = [False, True, True, True]
+
+    return out, labels, cmaps, units, vlims, center_zero
+
+
+def plot_frame_instrumental_quicklook(
+    ds: SpecscoutDataset,
+    *,
+    idx: int | None = None,
+    meta: FrameMeta | None = None,
+    pipe: PreprocessPipeline | None = None,
+    clim_percentiles: tuple[float, float] = (1.0, 99.0),
+    vlims=None,
+    figsize: tuple[float, float] = (10.0, 7.0),
+    title: str | None = None,
+) -> tuple[plt.Figure, np.ndarray]:
+    """
+    Plot a 4-panel instrumental quicklook for one frame.
+
+    Expected pipeline output shape is ``(T, F, 4)`` with channels ordered as:
+    ``(pol00, pol11, pol01_mag, pol01_phase)``.
+
+    Expects raw linear instrumental channels
+    """
+
+    _reject_db_recipe_pipe(
+        pipe,
+        func_name="plot_frame_instrumental_quicklook",
+        expected="linear instrumental inputs",
+    )
+
+    data, loaded_meta = _load_frame_for_plot(ds, idx=idx, meta=meta, pipe=pipe)
+    quick, labels, cmaps, units, center_zero = _build_instrumental_quicklook(data)
+
+    if title is None:
+        title = f"Instrumental quicklook — {loaded_meta.start_time_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+
+    return _plot_loaded_frame(
+        quick,
+        ds=ds,
+        loaded_meta=loaded_meta,
+        pipe=None,
+        channel_labels=labels,
+        cmap=cmaps,
+        clim_percentiles=clim_percentiles,
+        vlims=vlims,
+        cbar_units=units,
+        center_zero=center_zero,
+        figsize=figsize,
+        title=title,
+    )
+
+
+def plot_time_range_instrumental_quicklook(
+    zarr_path: str | Path,
+    *,
+    start_utc: str | pd.Timestamp,
+    stop_utc: str | pd.Timestamp,
+    chans: int | Sequence[int],
+    pipe: PreprocessPipeline | None = None,
+    clim_percentiles: tuple[float, float] = (1.0, 99.0),
+    vlims=None,
+    figsize: tuple[float, float] = (11.0, 7.5),
+    title: str | None = None,
+) -> tuple[plt.Figure, np.ndarray]:
+    """
+    Plot a 4-panel instrumental quicklook over a contiguous time range.
+
+    Expected pipeline output shape is ``(T, F, 4)`` with channels ordered as:
+    ``(pol00, pol11, pol01_mag, pol01_phase)``.
+
+    Expects raw linear instrumental channels
+    """
+
+    _reject_db_recipe_pipe(
+        pipe,
+        func_name="plot_frame_instrumental_quicklook",
+        expected="linear instrumental inputs",
+    )
+
+    data, times, _meta = read_time_range(
+        zarr_path,
+        start_utc=start_utc,
+        stop_utc=stop_utc,
+        chans=chans,
+        pipe=pipe,
+    )
+
+    if data.size == 0 or len(times) == 0:
+        fig, ax = plt.subplots(figsize=figsize)
+        ax.text(0.5, 0.5, "No data in requested time range", ha="center", va="center")
+        ax.set_axis_off()
+        return fig, np.asarray([ax])
+
+    quick, labels, cmaps, units, center_zero = _build_instrumental_quicklook(data)
+
+    cube, attrs, _time_axis = open_cube(zarr_path)
+    freqs_all, _ = freq_axis_from_attrs(attrs, cube.shape[1])
+    freqs = np.asarray(freqs_all[: quick.shape[1]], dtype=float)
+
+    if title is None:
+        start_ts = pd.to_datetime(times[0], utc=True).round("1s")
+        stop_ts = pd.to_datetime(times[-1], utc=True).round("1s")
+        title = (
+            "Instrumental quicklook — "
+            f"{start_ts.strftime('%Y-%m-%d %H:%M:%S UTC')} → "
+            f"{stop_ts.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        )
+
+    return _plot_waterfall_grid(
+        quick,
+        x_mode="timerange",
+        freqs=freqs,
+        times=pd.to_datetime(times, utc=True),
+        channel_labels=labels,
+        cmap=cmaps,
+        clim_percentiles=clim_percentiles,
+        vlims=vlims,
+        cbar_units=units,
+        center_zero=center_zero,
+        figsize=figsize,
+        title=title,
+    )
+
+
+def plot_frame_stokes_fractional(
+    ds: SpecscoutDataset,
+    *,
+    idx: int | None = None,
+    meta: FrameMeta | None = None,
+    pipe: PreprocessPipeline | None = None,
+    clim_percentiles: tuple[float, float] = (1.0, 99.0),
+    vlims=None,
+    figsize: tuple[float, float] = (10.0, 7.0),
+    title: str | None = None,
+) -> tuple[plt.Figure, np.ndarray]:
+    """
+    Plot a 4-panel Stokes diagnostic quicklook for one frame.
+
+    Expected pipeline output shape is ``(T, F, 4)`` with channels ordered as:
+    ``(stokes_I, stokes_Q, stokes_U, stokes_V)``.
+
+    Expects linear Stokes IQUV inputs
+    """
+
+    _reject_db_recipe_pipe(
+        pipe,
+        func_name="plot_frame_instrumental_quicklook",
+        expected="linear instrumental inputs",
+    )
+
+    data, loaded_meta = _load_frame_for_plot(ds, idx=idx, meta=meta, pipe=pipe)
+    quick, labels, cmaps, units, recipe_vlims, center_zero = _build_stokes_fractional_quicklook(data)
+
+    use_vlims = recipe_vlims if vlims is None else vlims
+
+    if title is None:
+        title = f"Stokes diagnostic — {loaded_meta.start_time_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+
+    return _plot_loaded_frame(
+        quick,
+        ds=ds,
+        loaded_meta=loaded_meta,
+        pipe=None,
+        channel_labels=labels,
+        cmap=cmaps,
+        clim_percentiles=clim_percentiles,
+        vlims=use_vlims,
+        cbar_units=units,
+        center_zero=center_zero,
+        figsize=figsize,
+        title=title,
+    )
+
+
+def plot_time_range_stokes_fractional(
+    zarr_path: str | Path,
+    *,
+    start_utc: str | pd.Timestamp,
+    stop_utc: str | pd.Timestamp,
+    chans: int | Sequence[int],
+    pipe: PreprocessPipeline | None = None,
+    clim_percentiles: tuple[float, float] = (1.0, 99.0),
+    vlims=None,
+    figsize: tuple[float, float] = (11.0, 7.5),
+    title: str | None = None,
+) -> tuple[plt.Figure, np.ndarray]:
+    """
+    Plot a 4-panel Stokes diagnostic quicklook over a contiguous time range.
+
+    Expected pipeline output shape is ``(T, F, 4)`` with channels ordered as:
+    ``(stokes_I, stokes_Q, stokes_U, stokes_V)``.
+
+    Expects linear Stokes IQUV inputs
+    """
+
+    _reject_db_recipe_pipe(
+        pipe,
+        func_name="plot_frame_instrumental_quicklook",
+        expected="linear instrumental inputs",
+    )
+
+    data, times, _meta = read_time_range(
+        zarr_path,
+        start_utc=start_utc,
+        stop_utc=stop_utc,
+        chans=chans,
+        pipe=pipe,
+    )
+
+    if data.size == 0 or len(times) == 0:
+        fig, ax = plt.subplots(figsize=figsize)
+        ax.text(0.5, 0.5, "No data in requested time range", ha="center", va="center")
+        ax.set_axis_off()
+        return fig, np.asarray([ax])
+
+    quick, labels, cmaps, units, recipe_vlims, center_zero = _build_stokes_fractional_quicklook(data)
+
+    use_vlims = recipe_vlims if vlims is None else vlims
+
+    cube, attrs, _time_axis = open_cube(zarr_path)
+    freqs_all, _ = freq_axis_from_attrs(attrs, cube.shape[1])
+    freqs = np.asarray(freqs_all[: quick.shape[1]], dtype=float)
+
+    if title is None:
+        start_ts = pd.to_datetime(times[0], utc=True).round("1s")
+        stop_ts = pd.to_datetime(times[-1], utc=True).round("1s")
+        title = (
+            f"Stokes diagnostic — {start_ts.strftime('%Y-%m-%d %H:%M:%S UTC')} → {stop_ts.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        )
+
+    return _plot_waterfall_grid(
+        quick,
+        x_mode="timerange",
+        freqs=freqs,
+        times=pd.to_datetime(times, utc=True),
+        channel_labels=labels,
+        cmap=cmaps,
+        clim_percentiles=clim_percentiles,
+        vlims=use_vlims,
+        cbar_units=units,
+        center_zero=center_zero,
+        figsize=figsize,
+        title=title,
+    )
+
+
 def save_frame_sequence(
     ds: SpecscoutDataset,
     *,
@@ -772,7 +1193,9 @@ def save_frame_sequence(
     channel_labels: Sequence[str] | None = None,
     cmap=cmr.pride,
     clim_percentiles: tuple[float, float] = (1.0, 99.0),
-    vlims: tuple[float, float] | None = None,
+    vlims=None,
+    cbar_units: str | Sequence[str] | None = None,
+    center_zero: bool | Sequence[bool] = False,
     dpi: int = 240,
     figsize: tuple[float, float] = (8.5, 5.5),
 ) -> list[Path]:
@@ -797,6 +1220,8 @@ def save_frame_sequence(
             cmap=cmap,
             clim_percentiles=clim_percentiles,
             vlims=vlims,
+            cbar_units=cbar_units,
+            center_zero=center_zero,
             figsize=figsize,
         )
 
@@ -818,7 +1243,9 @@ def save_frames_by_meta(
     channel_labels: Sequence[str] | None = None,
     cmap=cmr.pride,
     clim_percentiles: tuple[float, float] = (1.0, 99.0),
-    vlims: tuple[float, float] | None = None,
+    vlims=None,
+    cbar_units: str | Sequence[str] | None = None,
+    center_zero: bool | Sequence[bool] = False,
     dpi: int = 240,
     figsize: tuple[float, float] = (8.5, 5.5),
     name_template: str = "{i:05d}_{isotime}_idx{t_start_idx}.png",
@@ -845,6 +1272,8 @@ def save_frames_by_meta(
             cmap=cmap,
             clim_percentiles=clim_percentiles,
             vlims=vlims,
+            cbar_units=cbar_units,
+            center_zero=center_zero,
             figsize=figsize,
         )
 
