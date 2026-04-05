@@ -63,8 +63,18 @@ import numpy as np
 if TYPE_CHECKING:
     from .dataset import FrameMeta
 
+import warnings
+
 Transform = Callable[[np.ndarray, "FrameMeta"], np.ndarray]
 DataSpace = Literal["linear", "db"]
+
+
+_DB_UNSAFE_CHANNEL_KEYS = (
+    "phase",
+    "stokes_q",
+    "stokes_u",
+    "stokes_v",
+)
 
 
 # -----------------------------------------------------------------------------
@@ -562,6 +572,30 @@ class PreprocessPipeline:
             pipe = pipe.add(s, validate_spaces=validate_spaces)
         return pipe
 
+    def _maybe_warn_for_step(
+        self,
+        step: PipelineStep,
+        desc: DataDesc,
+    ) -> None:
+        if step.name != "safe_db":
+            return
+
+        if desc.channel_names is None:
+            return
+
+        bad = []
+        for name in desc.channel_names:
+            name_l = str(name).lower()
+            if "phase" in name_l or name_l == "stokes_q" or name_l == "stokes_u" or name_l == "stokes_v":
+                bad.append(str(name))
+
+        if bad:
+            warnings.warn(
+                f"safe_db is being applied to non power-like channels {tuple(bad)}; this is usually not physically meaningful.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+
     def __call__(self, frame: np.ndarray, meta: FrameMeta) -> np.ndarray:
         """
         Apply all steps in order.
@@ -579,6 +613,7 @@ class PreprocessPipeline:
 
         for step in self._steps:
             self._validate_step_against_desc(desc, step)
+            self._maybe_warn_for_step(step, desc)
             out = step.transform(out, meta)
             desc = self._apply_step_desc(desc, step)
             self._validate_frame_against_desc(out, desc)
@@ -655,6 +690,13 @@ def step_safe_db(
 ) -> PipelineStep:
     """
     Build a PipelineStep that converts linear-valued frames to dB via `safe_db`.
+
+    Notes
+    -----
+    This step is intended for non-negative, power-like quantities. If the
+    pipeline input descriptor indicates channels such as ``pol01_phase`` or
+    signed Stokes products (``stokes_Q``, ``stokes_U``, ``stokes_V``), the
+    pipeline should emit a warning when this step is applied.
     """
     t = make_safe_db_transform(floor=floor, dtype=dtype)
     cfg = {
