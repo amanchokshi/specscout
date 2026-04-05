@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=specscout-roi
 #SBATCH --nodes=1
-#SBATCH --ntasks=6
-#SBATCH --cpus-per-task=32
+#SBATCH --exclusive
 #SBATCH --time=06:00:00
 #SBATCH --output=logs/roi-%j.out
 #SBATCH --error=logs/roi-%j.err
@@ -19,21 +18,14 @@ ZARR_ROOT="/scratch/achokshi/specscout/data/zarr/${SEASON}"
 OUT_ROOT="/scratch/achokshi/specscout/data/roi/${SEASON}"
 
 STATIONS=(MARS1 MARS2 MARS3 MARS4 MARS5 MARS6)
-
-# ----------------------- environment -------------------------
+N_JOBS=6
 
 module purge
 module use /project/rrg-sievers/achokshi/software/modulefiles
 module load specscout
 
-mkdir -p "${OUT_ROOT}"
+mkdir -p "${OUT_ROOT}" logs
 
-# Keep each station confined to its allocated 32 cores.
-export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
-export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
-export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
-export NUMEXPR_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
-export VECLIB_MAXIMUM_THREADS="${SLURM_CPUS_PER_TASK}"
 
 echo "Job ID      : ${SLURM_JOB_ID}"
 echo "Node list   : ${SLURM_NODELIST}"
@@ -42,47 +34,41 @@ echo "Start UTC   : ${STARTUTC}"
 echo "Stop UTC    : ${STOPUTC}"
 echo "Zarr root   : ${ZARR_ROOT}"
 echo "Output root : ${OUT_ROOT}"
-echo "CPUs/task   : ${SLURM_CPUS_PER_TASK}"
+echo "Stations    : ${STATIONS[*]}"
+echo "Parallel jobs: ${N_JOBS}"
 echo
 
-# ----------------------- launch all stations -----------------
+run_station() {
+    local station="$1"
+    local zarr_path="${ZARR_ROOT}/${station}_${SEASON}.zarr"
+    local out_dir="${OUT_ROOT}/${station}/p99"
 
-pids=()
+    mkdir -p "${out_dir}"
 
-for STATION in "${STATIONS[@]}"; do
-    ZARR_PATH="${ZARR_ROOT}/${STATION}_${SEASON}.zarr"
-    OUT_DIR="${OUT_ROOT}/${STATION}/p99"
+    {
+        echo "============================================================"
+        echo "Station   : ${station}"
+        echo "Host      : $(hostname)"
+        echo "Start UTC : $(date -u '+%Y-%m-%d %H:%M:%S')"
+        echo "Zarr path : ${zarr_path}"
+        echo "Out dir   : ${out_dir}"
+        echo "============================================================"
 
-    mkdir -p "${OUT_DIR}"
+        specscout roi-search "${zarr_path}" \
+            --station "${station}" \
+            --startutc "${STARTUTC}" \
+            --stoputc "${STOPUTC}" \
+            --nsig 2 \
+            --out-dir "${out_dir}"
 
-    echo "Launching ${STATION}"
-    echo "  zarr : ${ZARR_PATH}"
-    echo "  out  : ${OUT_DIR}"
+        echo
+        echo "Finished ${station} at $(date -u '+%Y-%m-%d %H:%M:%S')"
+    } > "${out_dir}/run.log" 2>&1
+}
 
-    srun --exclusive -N1 -n1 -c "${SLURM_CPUS_PER_TASK}" \
-        specscout roi-search "${ZARR_PATH}" \
-        --station "${STATION}" \
-        --startutc "${STARTUTC}" \
-        --stoputc "${STOPUTC}" \
-        --nsig 2 \
-        --out-dir "${OUT_DIR}" \
-        > "${OUT_DIR}/run.log" 2>&1 &
+export SEASON STARTUTC STOPUTC ZARR_ROOT OUT_ROOT
+export -f run_station
 
-    pids+=($!)
-done
-
-# ----------------------- wait for all ------------------------
-
-fail=0
-for pid in "${pids[@]}"; do
-    if ! wait "${pid}"; then
-        fail=1
-    fi
-done
-
-if [[ "${fail}" -ne 0 ]]; then
-    echo "One or more station runs failed."
-    exit 1
-fi
+printf '%s\n' "${STATIONS[@]}" | parallel -j "${N_JOBS}" --joblog "${OUT_ROOT}/parallel_joblog.txt" run_station
 
 echo "All station runs completed successfully."
