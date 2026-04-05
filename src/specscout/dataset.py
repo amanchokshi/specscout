@@ -39,6 +39,7 @@ from .core import (
     time_index,
 )
 from .patches import PatchSpec, open_cube, read_patch
+from .preprocess import DataDesc
 
 if TYPE_CHECKING:
     from .preprocess import DataDesc, PreprocessPipeline
