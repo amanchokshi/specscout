@@ -39,7 +39,7 @@ import numpy as np
 import pandas as pd
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-from ..core import CHAN_LABELS, freq_axis_from_attrs
+from ..core import channel_names_from_indices, freq_axis_from_attrs
 from ..dataset import FrameMeta, SpecscoutDataset
 from ..patches import open_cube, read_time_range
 from ..preprocess import PreprocessPipeline
@@ -66,13 +66,25 @@ def _vlims_for_image(
 ) -> tuple[float, float]:
     """
     Determine color limits for one image.
+
+    When `vlims` is not provided, limits are estimated from finite pixels using
+    the requested percentiles. Fully non-finite images fall back to ``(0, 1)``.
+    Degenerate limits are also guarded against.
     """
     if vlims is not None:
         return float(vlims[0]), float(vlims[1])
 
+    finite = np.isfinite(img)
+    if not np.any(finite):
+        return 0.0, 1.0
+
     lo, hi = clim_percentiles
     vmin = float(np.nanpercentile(img, lo))
     vmax = float(np.nanpercentile(img, hi))
+
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+        return 0.0, 1.0
+
     return vmin, vmax
 
 
@@ -92,29 +104,44 @@ def _panel_layout(n_panels: int) -> tuple[int, int]:
     return nrows, ncols
 
 
-def _infer_panel_labels(
+def _resolve_panel_labels(
     *,
+    channel_labels: Sequence[str] | None,
     pipe: PreprocessPipeline | None,
     chans: int | Sequence[int] | None,
     n_panels: int,
 ) -> list[str]:
     """
-    Infer panel labels from a pipeline or raw channel selection.
+    Resolve panel labels for plotting.
+
+    Priority
+    --------
+    1. Explicit `channel_labels`
+    2. Pipeline output channel names
+    3. Raw channel indices mapped through `channel_names_from_indices`
+    4. Generic fallback labels
     """
-    if pipe is not None and len(pipe.steps) > 0:
-        last_cfg = pipe.steps[-1].config
-        labels = last_cfg.get("channel_order_out", None)
-        if isinstance(labels, list) and len(labels) == n_panels:
-            return [str(x) for x in labels]
+    if channel_labels is not None:
+        labels = [str(x) for x in channel_labels]
+        if len(labels) != n_panels:
+            raise ValueError("channel_labels length does not match number of panels.")
+        return labels
+
+    if pipe is not None:
+        names = getattr(pipe, "output_channel_names", None)
+        if names is not None:
+            names_l = [str(x) for x in names]
+            if len(names_l) == n_panels:
+                return names_l
+            if n_panels == 1 and len(names_l) >= 1:
+                return [names_l[0]]
 
     if chans is not None:
-        if isinstance(chans, int):
-            chans_t = (int(chans),)
-        else:
-            chans_t = tuple(int(c) for c in chans)
-
-        if len(chans_t) == n_panels:
-            return [CHAN_LABELS.get(c, f"chan{c}") for c in chans_t]
+        names_l = [str(x) for x in channel_names_from_indices(chans)]
+        if len(names_l) == n_panels:
+            return names_l
+        if n_panels == 1 and len(names_l) >= 1:
+            return [names_l[0]]
 
     return [f"ch{j}" for j in range(n_panels)]
 
@@ -122,7 +149,14 @@ def _infer_panel_labels(
 def _time_edges_from_datetimes(times: pd.DatetimeIndex) -> np.ndarray:
     """
     Build pcolormesh x-edges from sample timestamps.
+
+    Parameters
+    ----------
+    times
+        UTC DatetimeIndex with at least two entries.
     """
+    if len(times) < 2:
+        raise ValueError("times must contain at least 2 samples.")
     t_num = mdates.date2num(times.to_pydatetime())
     dt_days = np.median(np.diff(t_num))
     return np.concatenate(
@@ -185,6 +219,51 @@ def _load_frame_for_plot(
     return x, loaded_meta
 
 
+def _plot_loaded_frame(
+    data: np.ndarray,
+    *,
+    ds: SpecscoutDataset,
+    loaded_meta: FrameMeta,
+    pipe: PreprocessPipeline | None = None,
+    channel_labels: Sequence[str] | None = None,
+    cmap=cmr.pride,
+    clim_percentiles: tuple[float, float] = (1.0, 99.0),
+    vlims: tuple[float, float] | None = None,
+    figsize: tuple[float, float] = (8.5, 5.5),
+    title: str | None = None,
+) -> tuple[plt.Figure, np.ndarray]:
+    """
+    Plot an already loaded dataset frame.
+    """
+    freqs, _x_label = ds.freq_axis()
+    units = _infer_units(pipe)
+    n_panels = data.shape[2] if data.ndim == 3 else 1
+
+    resolved_labels = _resolve_panel_labels(
+        channel_labels=channel_labels,
+        pipe=pipe,
+        chans=ds.plan.chans,
+        n_panels=n_panels,
+    )
+
+    if title is None:
+        title = f"Frame start {loaded_meta.start_time_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+
+    return _plot_waterfall_grid(
+        data,
+        x_mode="frame",
+        freqs=freqs,
+        frame_meta=loaded_meta,
+        channel_labels=resolved_labels,
+        cmap=cmap,
+        clim_percentiles=clim_percentiles,
+        vlims=vlims,
+        figsize=figsize,
+        units=units,
+        title=title,
+    )
+
+
 def _plot_waterfall_grid(
     data: np.ndarray,
     *,
@@ -225,7 +304,7 @@ def _plot_waterfall_grid(
     elif arr.ndim != 3:
         raise ValueError(f"Expected data with shape (T, F) or (T, F, C), got {arr.shape}.")
 
-    nt, nfreq, n_panels = arr.shape
+    _nt, nfreq, n_panels = arr.shape
 
     if nfreq != len(freqs):
         raise ValueError("Frequency axis length does not match data shape.")
@@ -241,7 +320,14 @@ def _plot_waterfall_grid(
     fig, axs = plt.subplots(
         nrows,
         ncols,
-        figsize=figsize if n_panels == 1 else (max(figsize[0], 4.8 * ncols), max(figsize[1], 3.8 * nrows)),
+        figsize=(
+            figsize
+            if n_panels == 1
+            else (
+                max(figsize[0], 4.8 * ncols),
+                max(figsize[1], 3.8 * nrows),
+            )
+        ),
         squeeze=False,
         sharex=(x_mode == "timerange"),
         sharey=True,
@@ -251,8 +337,11 @@ def _plot_waterfall_grid(
     if x_mode == "frame":
         if frame_meta is None:
             raise ValueError("frame_meta must be provided when x_mode='frame'.")
-        extent = _time_range_extent_from_frame(arr[:, :, 0], meta=frame_meta, freqs=freqs)
-
+        extent = _time_range_extent_from_frame(
+            arr[:, :, 0],
+            meta=frame_meta,
+            freqs=freqs,
+        )
     else:
         if times is None or len(times) < 2:
             raise ValueError("times must be provided with at least 2 samples when x_mode='timerange'.")
@@ -347,7 +436,7 @@ def plot_frame(
     pipe
         Optional plotting pipeline applied after reading.
     channel_labels
-        Optional labels for multi-panel data.
+        Optional labels for panel titles.
     cmap
         Colormap. Defaults to ``cmr.pride``.
     clim_percentiles
@@ -365,30 +454,16 @@ def plot_frame(
         Matplotlib figure and axes array.
     """
     data, loaded_meta = _load_frame_for_plot(ds, idx=idx, meta=meta, pipe=pipe)
-    freqs, _x_label = ds.freq_axis()
-    units = _infer_units(pipe)
-
-    if data.ndim == 3 and channel_labels is None:
-        channel_labels = _infer_panel_labels(
-            pipe=pipe,
-            chans=ds.plan.chans,
-            n_panels=data.shape[2],
-        )
-
-    if title is None:
-        title = f"Frame start {loaded_meta.start_time_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}"
-
-    return _plot_waterfall_grid(
+    return _plot_loaded_frame(
         data,
-        x_mode="frame",
-        freqs=freqs,
-        frame_meta=loaded_meta,
+        ds=ds,
+        loaded_meta=loaded_meta,
+        pipe=pipe,
         channel_labels=channel_labels,
         cmap=cmap,
         clim_percentiles=clim_percentiles,
         vlims=vlims,
         figsize=figsize,
-        units=units,
         title=title,
     )
 
@@ -421,7 +496,7 @@ def plot_time_range(
     pipe
         Optional preprocessing pipeline applied after reading.
     channel_labels
-        Optional labels for multi-panel data.
+        Optional labels for panel titles.
     cmap
         Colormap. Defaults to ``cmr.pride``.
     clim_percentiles
@@ -448,22 +523,29 @@ def plot_time_range(
 
     if data.size == 0 or len(times) == 0:
         fig, ax = plt.subplots(figsize=figsize)
-        ax.text(0.5, 0.5, "No data in requested time range", ha="center", va="center")
+        ax.text(
+            0.5,
+            0.5,
+            "No data in requested time range",
+            ha="center",
+            va="center",
+        )
         ax.set_axis_off()
         return fig, np.asarray([ax])
 
-    _cube, attrs, _time_axis = open_cube(zarr_path)
+    cube, attrs, _time_axis = open_cube(zarr_path)
     nfreq = data.shape[1]
-    freqs_all, _x_label = freq_axis_from_attrs(attrs, attrs["nchan"] if False else _cube.shape[1])  # noqa: E501
+    freqs_all, _x_label = freq_axis_from_attrs(attrs, cube.shape[1])
     freqs = np.asarray(freqs_all[:nfreq], dtype=float)
     units = _infer_units(pipe)
 
-    if data.ndim == 3 and channel_labels is None:
-        channel_labels = _infer_panel_labels(
-            pipe=pipe,
-            chans=chans,
-            n_panels=data.shape[2],
-        )
+    n_panels = data.shape[2] if data.ndim == 3 else 1
+    resolved_labels = _resolve_panel_labels(
+        channel_labels=channel_labels,
+        pipe=pipe,
+        chans=chans,
+        n_panels=n_panels,
+    )
 
     if title is None:
         start_ts = pd.to_datetime(times[0], utc=True).round("1s")
@@ -475,7 +557,7 @@ def plot_time_range(
         x_mode="timerange",
         freqs=freqs,
         times=pd.to_datetime(times, utc=True),
-        channel_labels=channel_labels,
+        channel_labels=resolved_labels,
         cmap=cmap,
         clim_percentiles=clim_percentiles,
         vlims=vlims,
@@ -538,6 +620,10 @@ def plot_roi_event(
 ) -> tuple[plt.Figure, np.ndarray]:
     """
     Plot one ROI as a score panel plus a contiguous waterfall quicklook.
+
+    Notes
+    -----
+    The plotting pipeline must produce a 2D ``(T, F)`` array.
     """
     df = df_scores.copy()
     df[time_col] = pd.to_datetime(df[time_col], utc=True)
@@ -582,7 +668,7 @@ def plot_roi_event(
 
     label_lines = [
         f"{roi_start_str} → {roi_stop_str}",
-        f"peak={roi.peak_score:.3g}, sum={roi.sum_score:.3g}, n_frames={roi.n_frames}",
+        (f"peak={roi.peak_score:.3g}, sum={roi.sum_score:.3g}, n_frames={roi.n_frames}"),
         f"{qs_label}{station}",
     ]
 
@@ -701,9 +787,11 @@ def save_frame_sequence(
 
     written: list[Path] = []
     for idx in range(int(start_idx), int(stop_idx)):
-        fig, _axs = plot_frame(
-            ds,
-            idx=idx,
+        data, loaded_meta = _load_frame_for_plot(ds, idx=idx, pipe=pipe)
+        fig, _axs = _plot_loaded_frame(
+            data,
+            ds=ds,
+            loaded_meta=loaded_meta,
             pipe=pipe,
             channel_labels=channel_labels,
             cmap=cmap,
@@ -712,9 +800,7 @@ def save_frame_sequence(
             figsize=figsize,
         )
 
-        x, meta = _load_frame_for_plot(ds, idx=idx, pipe=pipe)
-        _ = x
-        isotime = meta.start_time_utc.strftime("%Y%m%d_%H%M%S")
+        isotime = loaded_meta.start_time_utc.strftime("%Y%m%d_%H%M%S")
         path = (out_dir / f"{idx:05d}_{isotime}.png").resolve()
         fig.savefig(path, dpi=dpi, bbox_inches="tight")
         plt.close(fig)
@@ -749,9 +835,11 @@ def save_frames_by_meta(
 
     written: list[Path] = []
     for i, meta in enumerate(metas_list):
-        fig, _axs = plot_frame(
-            ds,
-            meta=meta,
+        data, loaded_meta = _load_frame_for_plot(ds, meta=meta, pipe=pipe)
+        fig, _axs = _plot_loaded_frame(
+            data,
+            ds=ds,
+            loaded_meta=loaded_meta,
             pipe=pipe,
             channel_labels=channel_labels,
             cmap=cmap,
@@ -760,11 +848,11 @@ def save_frames_by_meta(
             figsize=figsize,
         )
 
-        isotime = meta.start_time_utc.strftime("%Y%m%d_%H%M%S")
+        isotime = loaded_meta.start_time_utc.strftime("%Y%m%d_%H%M%S")
         fname = name_template.format(
             i=i,
             isotime=isotime,
-            t_start_idx=int(meta.t_start_idx),
+            t_start_idx=int(loaded_meta.t_start_idx),
         )
         path = (out_dir / fname).resolve()
         fig.savefig(path, dpi=dpi, bbox_inches="tight")

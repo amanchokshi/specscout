@@ -23,6 +23,7 @@ This module should remain minimal and dependency-light.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Sequence
 
 import numpy as np
 
@@ -35,6 +36,20 @@ CHAN_LABELS: dict[int, str] = {
     2: "pol01_mag",
     3: "pol01_phase",
 }
+
+
+def channel_names_from_indices(
+    chans: int | Sequence[int],
+) -> tuple[str, ...]:
+    """
+    Convert channel indices to semantic names.
+    """
+    if isinstance(chans, int):
+        chans = (chans,)
+    else:
+        chans = tuple(int(c) for c in chans)
+
+    return tuple(CHAN_LABELS.get(c, f"chan{c}") for c in chans)
 
 
 def parse_utc(s: str) -> datetime:

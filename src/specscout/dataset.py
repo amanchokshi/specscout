@@ -30,11 +30,18 @@ from typing import TYPE_CHECKING, Iterator, Optional, Sequence
 
 import numpy as np
 
-from .core import clamp_int, freq_axis_from_attrs, parse_utc, seconds_to_samples, time_index
+from .core import (
+    channel_names_from_indices,
+    clamp_int,
+    freq_axis_from_attrs,
+    parse_utc,
+    seconds_to_samples,
+    time_index,
+)
 from .patches import PatchSpec, open_cube, read_patch
 
 if TYPE_CHECKING:
-    from .preprocess import PreprocessPipeline
+    from .preprocess import DataDesc, PreprocessPipeline
 
 Array = np.ndarray
 MaybeChans = int | tuple[int, ...]
@@ -432,7 +439,16 @@ class SpecscoutDataset(Sequence):
         )
 
         if apply_pipe and self._pipe is not None:
-            x = self._pipe(x, meta)
+            channel_names = channel_names = channel_names_from_indices(self._plan.chans)
+
+            pipe = self._pipe.with_input_desc(
+                DataDesc(
+                    channel_names=channel_names,
+                    space=self._pipe.input_space,
+                )
+            )
+
+            x = pipe(x, meta)
 
         return_meta_flag = self._return_meta if return_meta is None else bool(return_meta)
 

@@ -25,7 +25,8 @@ import numpy as np
 import pandas as pd
 import zarr
 
-from .core import parse_utc
+from .core import channel_names_from_indices, parse_utc
+from .preprocess import DataDesc
 
 if TYPE_CHECKING:
     from .preprocess import PreprocessPipeline
@@ -475,6 +476,14 @@ def read_time_range(
     )
 
     if pipe is not None:
+        channel_names = channel_names_from_indices(chans)
+
+        pipe = pipe.with_input_desc(
+            DataDesc(
+                channel_names=channel_names,
+                space=pipe.input_space,
+            )
+        )
         arr = pipe(arr, meta)
 
     return arr, times, meta

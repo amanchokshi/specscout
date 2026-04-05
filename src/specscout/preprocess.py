@@ -5,8 +5,12 @@ This module defines small, composable transforms that operate on extracted
 time-frequency arrays and return transformed arrays suitable for downstream
 analysis, plotting, or detection.
 
-Transform composition is performed via `PreprocessPipeline`, which provides
-ordered execution, metadata tracking, and optional DataSpace validation.
+Transform composition is performed via `PreprocessPipeline`, which provides:
+
+- ordered execution of transforms
+- pipeline metadata tracking
+- optional DataSpace validation
+- lightweight semantic tracking of the transformed data product
 
 Current responsibilities
 ------------------------
@@ -15,7 +19,9 @@ Current responsibilities
   - dual-pol autocorrelations -> Stokes I
   - linear products -> full Stokes (I, Q, U, V)
 - `PreprocessPipeline`: a lightweight, introspectable transform chain with
-  optional DataSpace tracking and JSON-serializable step metadata
+  optional DataSpace validation and JSON-serializable step metadata
+- `DataDesc`: a minimal semantic description of the current data product,
+  including channel names and data space
 
 Design notes
 ------------
@@ -27,22 +33,28 @@ interface:
 where `frame` is typically an extracted `(T, F)` or `(T, F, C)` block and
 `meta` provides contextual metadata about the extracted interval.
 
-This module intentionally focuses on small, reusable transform primitives.
-Background estimation, PCA modeling, and ROI detection live elsewhere in the
-package (`outlier.py`, `rolling.py`, `roi_search.py`).
+The pipeline itself tracks a lightweight `DataDesc` object. This allows
+specscout to preserve information such as channel names across transforms:
+
+- raw `(pol00, pol11)` -> `stokes_I`
+- raw `(pol00, pol11, pol01_mag, pol01_phase)` -> full Stokes
+- linear -> dB
+
+This metadata is useful for plotting, provenance, and validation, while
+keeping the transform API itself simple and backward-compatible.
 
 Notes
 -----
-- Pipelines are treated as immutable: methods such as `add()` and
-  `with_metadata()` return new pipeline objects.
-- Pipeline serialization stores step configs and metadata, but not executable
-  Python callables.
+- Pipelines are treated as immutable: methods such as `add()`,
+  `with_metadata()`, and `with_input_desc()` return new pipeline objects.
+- Pipeline serialization stores step configs, metadata, and data descriptors,
+  but not executable Python callables.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Literal, Optional, Sequence
 
@@ -53,6 +65,44 @@ if TYPE_CHECKING:
 
 Transform = Callable[[np.ndarray, "FrameMeta"], np.ndarray]
 DataSpace = Literal["linear", "db"]
+
+
+# -----------------------------------------------------------------------------
+# Lightweight semantic descriptor
+# -----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DataDesc:
+    """
+    Minimal semantic description of a time-frequency product.
+
+    Parameters
+    ----------
+    channel_names
+        Optional channel / product names. Examples:
+        - ``("pol00",)`` for a single raw product
+        - ``("pol00", "pol11")`` for dual-pol autocorrelations
+        - ``("stokes_I",)`` after Stokes-I conversion
+        - ``("stokes_I", "stokes_Q", "stokes_U", "stokes_V")`` for full Stokes
+    space
+        Semantic data space, e.g. ``"linear"`` or ``"db"``.
+    """
+
+    channel_names: tuple[str, ...] | None = None
+    space: DataSpace = "linear"
+
+    @property
+    def n_channels(self) -> int | None:
+        """Number of named channels, or None if unknown."""
+        return None if self.channel_names is None else len(self.channel_names)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize as a JSON-compatible dict."""
+        return {
+            "channel_names": None if self.channel_names is None else list(self.channel_names),
+            "space": self.space,
+        }
 
 
 # -----------------------------------------------------------------------------
@@ -80,6 +130,9 @@ def safe_db(x: np.ndarray, floor: float = 1e-12) -> np.ndarray:
         Array of the same shape as `x`, dtype float (numpy chooses),
         containing dB values.
     """
+    if floor <= 0:
+        raise ValueError("floor must be positive.")
+
     with np.errstate(divide="ignore", invalid="ignore"):
         x2 = np.array(x, copy=True)
         finite = np.isfinite(x2)
@@ -95,15 +148,10 @@ def make_safe_db_transform(
     """
     Create a transform that converts linear-valued frames to dB using `safe_db`.
 
-    This is useful as an explicit preprocessing step when you want:
-    - dB-valued frames with no further transformation
-    - clean DataSpace tracking ("linear" -> "db")
-    - consistent NaN behavior (NaNs remain NaNs)
-
     Parameters
     ----------
     floor
-        Floor applied before log10 to avoid log10(0). Passed to `core.safe_db`.
+        Floor applied before log10 to avoid log10(0).
     dtype
         Output dtype.
 
@@ -130,7 +178,7 @@ def make_stokes_i_transform(
 ) -> Transform:
     """
     Create a transform that converts dual-linear autocorrelation inputs
-    ``(XX, YY)`` into Stokes I.
+    ``(pol00, pol11)`` into Stokes I.
 
     Parameters
     ----------
@@ -144,11 +192,11 @@ def make_stokes_i_transform(
 
     Notes
     -----
-    Expected input shape is ``(T, F, 2)`` ordered as ``(XX, YY)``.
+    Expected input shape is ``(T, F, 2)`` ordered as ``(pol00, pol11)``.
 
     Convention::
 
-        I = 0.5 * (XX + YY)
+        I = 0.5 * (pol00 + pol11)
     """
     out_dtype = np.dtype(dtype)
 
@@ -156,11 +204,11 @@ def make_stokes_i_transform(
         x = np.asarray(frame_tfc)
 
         if x.ndim != 3 or x.shape[2] != 2:
-            raise ValueError("Stokes I transform expects input with shape (T, F, 2) ordered as (XX, YY).")
+            raise ValueError("Stokes I transform expects input with shape (T, F, 2) ordered as (pol00, pol11).")
 
-        xx = x[:, :, 0]
-        yy = x[:, :, 1]
-        I = 0.5 * (xx + yy)
+        pol00 = x[:, :, 0]
+        pol11 = x[:, :, 1]
+        I = 0.5 * (pol00 + pol11)
 
         return np.asarray(I, dtype=out_dtype)
 
@@ -189,22 +237,22 @@ def make_stokes_iquv_transform(
     -----
     Expected input shape is ``(T, F, 4)`` ordered as::
 
-        (XX, YY, XY_mag, XY_phase)
+        (pol00, pol11, pol01_mag, pol01_phase)
 
     Output shape is ``(T, F, 4)`` ordered as::
 
-        (I, Q, U, V)
+        (stokes_I, stokes_Q, stokes_U, stokes_V)
 
     Convention::
 
-        I = 0.5 * (XX + YY)
-        Q = 0.5 * (XX - YY)
-        U = Re(XY)
-        V = Im(XY)
+        I = 0.5 * (pol00 + pol11)
+        Q = 0.5 * (pol00 - pol11)
+        U = Re(pol01)
+        V = Im(pol01)
 
     where::
 
-        XY = XY_mag * exp(1j * XY_phase)
+        pol01 = pol01_mag * exp(1j * pol01_phase)
     """
     out_dtype = np.dtype(dtype)
 
@@ -212,19 +260,21 @@ def make_stokes_iquv_transform(
         x = np.asarray(frame_tfc)
 
         if x.ndim != 3 or x.shape[2] != 4:
-            raise ValueError("Stokes IQUV transform expects input with shape (T, F, 4) ordered as (XX, YY, XY_mag, XY_phase).")
+            raise ValueError(
+                "Stokes IQUV transform expects input with shape (T, F, 4) ordered as (pol00, pol11, pol01_mag, pol01_phase)."
+            )
 
-        xx = x[:, :, 0]
-        yy = x[:, :, 1]
-        xy_mag = x[:, :, 2]
-        xy_phase = x[:, :, 3]
+        pol00 = x[:, :, 0]
+        pol11 = x[:, :, 1]
+        pol01_mag = x[:, :, 2]
+        pol01_phase = x[:, :, 3]
 
-        xy = xy_mag * np.exp(1j * xy_phase)
+        pol01 = pol01_mag * np.exp(1j * pol01_phase)
 
-        I = 0.5 * (xx + yy)
-        Q = 0.5 * (xx - yy)
-        U = np.real(xy)
-        V = np.imag(xy)
+        I = 0.5 * (pol00 + pol11)
+        Q = 0.5 * (pol00 - pol11)
+        U = np.real(pol01)
+        V = np.imag(pol01)
 
         out = np.stack([I, Q, U, V], axis=2)
         return np.asarray(out, dtype=out_dtype)
@@ -275,6 +325,7 @@ class PreprocessPipeline:
     Provides:
     - Ordered execution of transforms
     - Optional DataSpace validation
+    - Lightweight semantic tracking via `DataDesc`
     - JSON-serializable configuration
     """
 
@@ -284,35 +335,127 @@ class PreprocessPipeline:
         *,
         metadata: Optional[dict[str, Any]] = None,
         input_space: DataSpace = "linear",
+        input_desc: DataDesc | None = None,
     ) -> None:
         self._steps = list(steps) if steps is not None else []
         self._metadata = dict(metadata) if metadata is not None else {}
-        self._input_space = input_space
+
+        if input_desc is None:
+            input_desc = DataDesc(channel_names=None, space=input_space)
+        else:
+            if input_desc.space != input_space:
+                raise ValueError(f"input_desc.space={input_desc.space!r} does not match input_space={input_space!r}.")
+
+        self._input_desc = input_desc
 
     @property
     def steps(self) -> tuple[PipelineStep, ...]:
+        """Immutable view of pipeline steps."""
         return tuple(self._steps)
 
     @property
     def metadata(self) -> dict[str, Any]:
+        """Pipeline-level metadata dict (copied on access)."""
         return dict(self._metadata)
 
     @property
+    def input_desc(self) -> DataDesc:
+        """Input semantic descriptor."""
+        return self._input_desc
+
+    @property
+    def output_desc(self) -> DataDesc:
+        """Output semantic descriptor after all steps."""
+        desc = self._input_desc
+        for step in self._steps:
+            desc = self._apply_step_desc(desc, step)
+        return desc
+
+    @property
     def input_space(self) -> DataSpace:
-        return self._input_space
+        """Declared semantic space of pipeline inputs."""
+        return self._input_desc.space
 
     @property
     def output_space(self) -> DataSpace:
-        if not self._steps:
-            return self._input_space
-        last = self._steps[-1]
-        return last.out_space if last.out_space is not None else self._input_space
+        """Declared semantic space of pipeline outputs."""
+        return self.output_desc.space
 
-    def _current_space(self) -> DataSpace:
+    @property
+    def input_channel_names(self) -> tuple[str, ...] | None:
+        """Named input channels, if known."""
+        return self._input_desc.channel_names
+
+    @property
+    def output_channel_names(self) -> tuple[str, ...] | None:
+        """Named output channels, if known."""
+        return self.output_desc.channel_names
+
+    def _current_desc(self) -> DataDesc:
         if not self._steps:
-            return self._input_space
-        s = self._steps[-1].out_space
-        return s if s is not None else self._input_space
+            return self._input_desc
+        return self.output_desc
+
+    def _apply_step_desc(self, desc: DataDesc, step: PipelineStep) -> DataDesc:
+        out_space = step.out_space if step.out_space is not None else desc.space
+
+        out_names = step.config.get("channel_order_out", None)
+        if out_names is not None:
+            out_names_t = tuple(str(x) for x in out_names)
+        else:
+            out_names_t = desc.channel_names
+
+        return DataDesc(channel_names=out_names_t, space=out_space)
+
+    def _validate_step_against_desc(self, desc: DataDesc, step: PipelineStep) -> None:
+        expected_space = step.in_space
+        if expected_space is not None and expected_space != desc.space:
+            raise ValueError(
+                f"Cannot apply step {step.name!r}: in_space={expected_space!r} does not match current space {desc.space!r}."
+            )
+
+        expected_names = step.config.get("channel_order_in", None)
+        if expected_names is not None and desc.channel_names is not None:
+            expected_t = tuple(str(x) for x in expected_names)
+            if desc.channel_names != expected_t:
+                raise ValueError(
+                    f"Cannot apply step {step.name!r}: expected channels {expected_t!r}, got {desc.channel_names!r}."
+                )
+
+    @staticmethod
+    def _infer_array_n_channels(frame: np.ndarray) -> int:
+        """
+        Infer number of channels from an array shape.
+
+        Returns
+        -------
+        int
+            - 1 for ``(T, F)``
+            - C for ``(T, F, C)``
+        """
+        x = np.asarray(frame)
+        if x.ndim == 2:
+            return 1
+        if x.ndim == 3:
+            return int(x.shape[2])
+        raise ValueError(f"Expected frame with shape (T, F) or (T, F, C), got {x.shape}.")
+
+    @classmethod
+    def _validate_frame_against_desc(cls, frame: np.ndarray, desc: DataDesc) -> None:
+        """
+        Validate an array shape against a known channel description.
+        """
+        if desc.channel_names is None:
+            return
+
+        n_expected = len(desc.channel_names)
+        n_found = cls._infer_array_n_channels(frame)
+        if n_found != n_expected:
+            raise ValueError(
+                f"Frame shape is inconsistent with declared channel_names "
+                f"{desc.channel_names!r}: expected {n_expected} channel(s), "
+                f"found {n_found}."
+            )
 
     def with_metadata(self, **metadata: Any) -> "PreprocessPipeline":
         """
@@ -323,8 +466,42 @@ class PreprocessPipeline:
         return PreprocessPipeline(
             self._steps,
             metadata=md,
-            input_space=self._input_space,
+            input_space=self._input_desc.space,
+            input_desc=self._input_desc,
         )
+
+    def with_input_desc(self, desc: DataDesc) -> "PreprocessPipeline":
+        """
+        Return a new pipeline with an updated input descriptor.
+        """
+        current = self._input_desc
+        if current.space != desc.space:
+            raise ValueError(
+                f"Input descriptor space {desc.space!r} does not match current pipeline input space {current.space!r}."
+            )
+
+        return PreprocessPipeline(
+            self._steps,
+            metadata=self._metadata,
+            input_space=desc.space,
+            input_desc=desc,
+        )
+
+    def with_input_channels(self, *channel_names: str) -> "PreprocessPipeline":
+        """
+        Return a new pipeline with named input channels.
+
+        Examples
+        --------
+        >>> pipe = (
+        ...     PreprocessPipeline(input_space="linear")
+        ...     .with_input_channels("pol00", "pol11")
+        ...     .add(step_stokes_i())
+        ...     .add(step_safe_db())
+        ... )
+        """
+        desc = replace(self._input_desc, channel_names=tuple(str(x) for x in channel_names))
+        return self.with_input_desc(desc)
 
     def add_step(
         self,
@@ -336,31 +513,34 @@ class PreprocessPipeline:
         out_space: Optional[DataSpace] = None,
         validate_spaces: bool = True,
     ) -> "PreprocessPipeline":
+        """
+        Return a new pipeline with one step appended.
+        """
         if not name:
             raise ValueError("step name must be non-empty")
 
-        config = {} if config is None else config
-
-        if validate_spaces and in_space is not None:
-            current = self._current_space()
-            if in_space != current:
-                raise ValueError(f"Cannot add step {name!r}: in_space={in_space!r} != current space {current!r}")
+        config = {} if config is None else dict(config)
 
         step = PipelineStep(
             name=name,
             transform=transform,
-            config=dict(config),
+            config=config,
             in_space=in_space,
             out_space=out_space,
         )
 
+        if validate_spaces:
+            self._validate_step_against_desc(self._current_desc(), step)
+
         return PreprocessPipeline(
             [*self._steps, step],
             metadata=self._metadata,
-            input_space=self._input_space,
+            input_space=self._input_desc.space,
+            input_desc=self._input_desc,
         )
 
     def add(self, step: PipelineStep, *, validate_spaces: bool = True) -> "PreprocessPipeline":
+        """Convenience wrapper to add a pre-built `PipelineStep`."""
         return self.add_step(
             step.name,
             step.transform,
@@ -376,24 +556,45 @@ class PreprocessPipeline:
         *,
         validate_spaces: bool = True,
     ) -> "PreprocessPipeline":
+        """Append multiple steps, returning a new pipeline."""
         pipe = self
         for s in steps:
             pipe = pipe.add(s, validate_spaces=validate_spaces)
         return pipe
 
     def __call__(self, frame: np.ndarray, meta: FrameMeta) -> np.ndarray:
-        out = frame
+        """
+        Apply all steps in order.
+
+        Notes
+        -----
+        The pipeline tracks the evolving `DataDesc` internally while applying
+        transforms. The returned object is still just the transformed array,
+        preserving the existing specscout transform API.
+        """
+        out = np.asarray(frame)
+        desc = self._input_desc
+
+        self._validate_frame_against_desc(out, desc)
+
         for step in self._steps:
+            self._validate_step_against_desc(desc, step)
             out = step.transform(out, meta)
+            desc = self._apply_step_desc(desc, step)
+            self._validate_frame_against_desc(out, desc)
+
         return out
 
     def summary(self) -> str:
+        """Return a human-readable multi-line summary of the pipeline."""
         lines: list[str] = []
         lines.append("########################")
         lines.append("#  PreprocessPipeline  #")
         lines.append("########################\n")
-        lines.append(f"input_space:  {self._input_space}")
-        lines.append(f"output_space: {self.output_space}\n")
+        lines.append(f"input_space:    {self.input_space}")
+        lines.append(f"output_space:   {self.output_space}")
+        lines.append(f"input_channels: {self.input_channel_names}")
+        lines.append(f"output_channels:{self.output_channel_names}\n")
 
         if self._metadata:
             lines.append(f"metadata: {self._metadata}")
@@ -401,14 +602,25 @@ class PreprocessPipeline:
         lines.append(f"n_steps: {len(self._steps)}")
 
         for i, s in enumerate(self._steps):
-            lines.append(f"[{i}] {s.name} in={s.in_space or '?'} out={s.out_space or '?'} config={s.config}")
+            cin = s.config.get("channel_order_in", "?")
+            cout = s.config.get("channel_order_out", "?")
+            lines.append(
+                f"[{i}] {s.name} "
+                f"in_space={s.in_space or '?'} "
+                f"out_space={s.out_space or '?'} "
+                f"in_channels={cin} "
+                f"out_channels={cout} "
+                f"config={s.config}"
+            )
 
         return "\n".join(lines)
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize pipeline configuration to a JSON-compatible dict."""
         return {
             "metadata": dict(self._metadata),
-            "input_space": self._input_space,
+            "input_desc": self._input_desc.to_dict(),
+            "output_desc": self.output_desc.to_dict(),
             "steps": [
                 {
                     "name": s.name,
@@ -421,6 +633,7 @@ class PreprocessPipeline:
         }
 
     def save_json(self, path: str | Path, *, indent: int = 2) -> Path:
+        """Save `to_dict()` as JSON."""
         out = Path(path)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(self.to_dict(), indent=indent, sort_keys=True) + "\n")
@@ -465,14 +678,14 @@ def step_stokes_i(
     out_space: DataSpace = "linear",
 ) -> PipelineStep:
     """
-    Build a PipelineStep that converts (XX, YY) into Stokes I.
+    Build a PipelineStep that converts ``(pol00, pol11)`` into ``stokes_I``.
     """
     t = make_stokes_i_transform(dtype=dtype)
     cfg = {
         "dtype": str(np.dtype(dtype)),
-        "channel_order_in": ["XX", "YY"],
-        "channel_order_out": ["I"],
-        "convention": "I = 0.5 * (XX + YY)",
+        "channel_order_in": ["pol00", "pol11"],
+        "channel_order_out": ["stokes_I"],
+        "convention": "stokes_I = 0.5 * (pol00 + pol11)",
     }
     return PipelineStep(
         name=name,
@@ -491,19 +704,24 @@ def step_stokes_iquv(
     out_space: DataSpace = "linear",
 ) -> PipelineStep:
     """
-    Build a PipelineStep that converts (XX, YY, XY_mag, XY_phase) into
-    full Stokes (I, Q, U, V).
+    Build a PipelineStep that converts raw ALBATROS linear products into
+    full Stokes ``(stokes_I, stokes_Q, stokes_U, stokes_V)``.
     """
     t = make_stokes_iquv_transform(dtype=dtype)
     cfg = {
         "dtype": str(np.dtype(dtype)),
-        "channel_order_in": ["XX", "YY", "XY_mag", "XY_phase"],
-        "channel_order_out": ["I", "Q", "U", "V"],
+        "channel_order_in": ["pol00", "pol11", "pol01_mag", "pol01_phase"],
+        "channel_order_out": [
+            "stokes_I",
+            "stokes_Q",
+            "stokes_U",
+            "stokes_V",
+        ],
         "convention": {
-            "I": "0.5 * (XX + YY)",
-            "Q": "0.5 * (XX - YY)",
-            "U": "real(XY_mag * exp(1j * XY_phase))",
-            "V": "imag(XY_mag * exp(1j * XY_phase))",
+            "stokes_I": "0.5 * (pol00 + pol11)",
+            "stokes_Q": "0.5 * (pol00 - pol11)",
+            "stokes_U": "real(pol01_mag * exp(1j * pol01_phase))",
+            "stokes_V": "imag(pol01_mag * exp(1j * pol01_phase))",
         },
     }
     return PipelineStep(

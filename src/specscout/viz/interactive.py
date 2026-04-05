@@ -29,12 +29,7 @@ import matplotlib.pyplot as plt
 
 from ..dataset import FrameMeta, SpecscoutDataset
 from ..preprocess import PreprocessPipeline
-from .static import (
-    _infer_panel_labels,
-    _infer_units,
-    _load_frame_for_plot,
-    _plot_waterfall_grid,
-)
+from .static import _load_frame_for_plot, _plot_loaded_frame
 
 
 @dataclass(frozen=True)
@@ -95,11 +90,12 @@ def scrub_frames_sequence(
     pipe
         Optional plotting pipeline applied after reading each frame.
     channel_labels
-        Optional labels for multi-panel data.
+        Optional labels for panel titles.
     cmap
         Colormap. Defaults to ``cmr.pride``.
     clim_percentiles
-        Percentiles used for dynamic per-frame color scaling when `vlims` is None.
+        Percentiles used for dynamic per-frame color scaling when `vlims` is
+        None.
     vlims
         Optional fixed color limits.
     figsize
@@ -123,29 +119,18 @@ def scrub_frames_sequence(
     frame_indices = list(range(start_i, stop_i))
 
     data0, meta0 = _load_frame_for_plot(ds, idx=frame_indices[0], pipe=pipe)
-    freqs, _x_label = ds.freq_axis()
-    units = _infer_units(pipe)
-
-    if data0.ndim == 3 and channel_labels is None:
-        channel_labels = _infer_panel_labels(
-            pipe=pipe,
-            chans=ds.plan.chans,
-            n_panels=data0.shape[2],
-        )
-
     title0 = f"Frame {frame_indices[0]}/{n_total - 1} — {meta0.start_time_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}"
 
-    fig, _axs = _plot_waterfall_grid(
+    fig, _axs = _plot_loaded_frame(
         data0,
-        x_mode="frame",
-        freqs=freqs,
-        frame_meta=meta0,
+        ds=ds,
+        loaded_meta=meta0,
+        pipe=pipe,
         channel_labels=channel_labels,
         cmap=cmap,
         clim_percentiles=clim_percentiles,
         vlims=vlims,
         figsize=figsize,
-        units=units,
         title=title0,
     )
 
@@ -155,17 +140,16 @@ def scrub_frames_sequence(
 
         fig.clf()
         title = f"Frame {real_idx}/{n_total - 1} — {meta.start_time_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}"
-        _plot_waterfall_grid(
+        _plot_loaded_frame(
             data,
-            x_mode="frame",
-            freqs=freqs,
-            frame_meta=meta,
+            ds=ds,
+            loaded_meta=meta,
+            pipe=pipe,
             channel_labels=channel_labels,
             cmap=cmap,
             clim_percentiles=clim_percentiles,
             vlims=vlims,
             figsize=figsize,
-            units=units,
             title=title,
         )
         fig.canvas.draw_idle()
@@ -202,7 +186,8 @@ def scrub_frames_by_meta(
     figsize: tuple[float, float] = (8.5, 5.5),
 ) -> ScrubberResult:
     """
-    Create an interactive scrubber over arbitrary frames identified by FrameMeta.
+    Create an interactive scrubber over arbitrary frames identified by
+    `FrameMeta`.
 
     Parameters
     ----------
@@ -213,11 +198,12 @@ def scrub_frames_by_meta(
     pipe
         Optional plotting pipeline applied after reading each frame.
     channel_labels
-        Optional labels for multi-panel data.
+        Optional labels for panel titles.
     cmap
         Colormap. Defaults to ``cmr.pride``.
     clim_percentiles
-        Percentiles used for dynamic per-frame color scaling when `vlims` is None.
+        Percentiles used for dynamic per-frame color scaling when `vlims` is
+        None.
     vlims
         Optional fixed color limits.
     figsize
@@ -233,33 +219,22 @@ def scrub_frames_by_meta(
         raise ValueError("metas must be non-empty.")
 
     data0, meta0 = _load_frame_for_plot(ds, meta=metas_list[0], pipe=pipe)
-    freqs, _x_label = ds.freq_axis()
-    units = _infer_units(pipe)
-
-    if data0.ndim == 3 and channel_labels is None:
-        channel_labels = _infer_panel_labels(
-            pipe=pipe,
-            chans=ds.plan.chans,
-            n_panels=data0.shape[2],
-        )
-
     title0 = (
         f"Frame 0/{len(metas_list) - 1} — "
         f"{meta0.start_time_utc.strftime('%Y-%m-%d %H:%M:%S UTC')} "
         f"(t_start_idx={meta0.t_start_idx})"
     )
 
-    fig, _axs = _plot_waterfall_grid(
+    fig, _axs = _plot_loaded_frame(
         data0,
-        x_mode="frame",
-        freqs=freqs,
-        frame_meta=meta0,
+        ds=ds,
+        loaded_meta=meta0,
+        pipe=pipe,
         channel_labels=channel_labels,
         cmap=cmap,
         clim_percentiles=clim_percentiles,
         vlims=vlims,
         figsize=figsize,
-        units=units,
         title=title0,
     )
 
@@ -273,17 +248,16 @@ def scrub_frames_by_meta(
             f"{meta.start_time_utc.strftime('%Y-%m-%d %H:%M:%S UTC')} "
             f"(t_start_idx={meta.t_start_idx})"
         )
-        _plot_waterfall_grid(
+        _plot_loaded_frame(
             data,
-            x_mode="frame",
-            freqs=freqs,
-            frame_meta=meta,
+            ds=ds,
+            loaded_meta=meta,
+            pipe=pipe,
             channel_labels=channel_labels,
             cmap=cmap,
             clim_percentiles=clim_percentiles,
             vlims=vlims,
             figsize=figsize,
-            units=units,
             title=title,
         )
         fig.canvas.draw_idle()
