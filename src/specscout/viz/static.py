@@ -509,6 +509,21 @@ def _plot_waterfall_grid(
     return fig, axs
 
 
+def _resolve_plot_pipe(
+    ds: SpecscoutDataset,
+    pipe: PreprocessPipeline | None,
+) -> PreprocessPipeline | None:
+    """
+    Resolve the plotting pipeline.
+
+    Priority
+    --------
+    1. Explicit `pipe` argument passed to the plotting function
+    2. Dataset pipeline `ds.pipe`
+    """
+    return pipe if pipe is not None else ds.pipe
+
+
 def plot_frame(
     ds: SpecscoutDataset,
     *,
@@ -529,7 +544,10 @@ def plot_frame(
 
     Exactly one of `idx` or `meta` must be provided.
     """
+
+    pipe = _resolve_plot_pipe(ds, pipe)
     data, loaded_meta = _load_frame_for_plot(ds, idx=idx, meta=meta, pipe=pipe)
+
     return _plot_loaded_frame(
         data,
         ds=ds,
@@ -967,6 +985,7 @@ def plot_frame_instrumental_quicklook(
         expected="linear instrumental inputs",
     )
 
+    pipe = _resolve_plot_pipe(ds, pipe)
     data, loaded_meta = _load_frame_for_plot(ds, idx=idx, meta=meta, pipe=pipe)
     quick, labels, cmaps, units, center_zero = _build_instrumental_quicklook(data)
 
@@ -1087,6 +1106,7 @@ def plot_frame_stokes_fractional(
         expected="linear instrumental inputs",
     )
 
+    pipe = _resolve_plot_pipe(ds, pipe)
     data, loaded_meta = _load_frame_for_plot(ds, idx=idx, meta=meta, pipe=pipe)
     quick, labels, cmaps, units, recipe_vlims, center_zero = _build_stokes_fractional_quicklook(data)
 
@@ -1210,6 +1230,7 @@ def save_frame_sequence(
 
     written: list[Path] = []
     for idx in range(int(start_idx), int(stop_idx)):
+        pipe = _resolve_plot_pipe(ds, pipe)
         data, loaded_meta = _load_frame_for_plot(ds, idx=idx, pipe=pipe)
         fig, _axs = _plot_loaded_frame(
             data,
@@ -1262,6 +1283,7 @@ def save_frames_by_meta(
 
     written: list[Path] = []
     for i, meta in enumerate(metas_list):
+        pipe = _resolve_plot_pipe(ds, pipe)
         data, loaded_meta = _load_frame_for_plot(ds, meta=meta, pipe=pipe)
         fig, _axs = _plot_loaded_frame(
             data,
