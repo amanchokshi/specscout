@@ -211,5 +211,5 @@ __marimo__/
 .DS_Store
 data
 roi_grid
-notebooks
 slurm/logs
+notebooks/archive
