@@ -212,3 +212,4 @@ __marimo__/
 data
 roi_grid
 slurm/logs
+notebooks/processing
