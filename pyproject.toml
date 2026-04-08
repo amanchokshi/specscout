@@ -19,7 +19,9 @@ classifiers = [
 
 dependencies = [
     "cmasher>=1.9.2",
+    "h5netcdf>=1.8.1",
     "matplotlib>=3.10.8",
+    "netcdf4>=1.7.4",
     "numpy>=2.4.2",
     "pandas>=3.0.0",
     "pbio>=0.0.4",
