@@ -2,7 +2,8 @@
 #SBATCH --job-name=specscout-roi
 #SBATCH --nodes=1
 #SBATCH --exclusive
-#SBATCH --time=06:00:00
+#SBATCH --time=18:00:00
+#SBATCH --ntasks-per-node=192
 #SBATCH --output=logs/roi-%j.out
 #SBATCH --error=logs/roi-%j.err
 
