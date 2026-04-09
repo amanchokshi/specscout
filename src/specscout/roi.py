@@ -464,7 +464,7 @@ def run_roi_search(
     bg = RollingPCABackground(
         k=k_fit,
         center=True,
-        freq_mask=rfi_mask,
+        # freq_mask=rfi_mask,
         use_randomized=True,
         n_iter=2,
         random_state=random_state,
