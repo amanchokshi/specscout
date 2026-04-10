@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -322,6 +323,72 @@ def zarrmeta_cmd(args: argparse.Namespace) -> None:
             print(f"{k:<14}: {v}")
 
 
+def goes_xrs_cmd(args: argparse.Namespace) -> None:
+    """
+    Download GOES soft X-ray 1 s NetCDF files for a given year.
+
+    Files are downloaded recursively from the NOAA archive using `wget` into:
+
+        out_dir / YEAR / ...
+
+    Parameters expected on `args`
+    -----------------------------
+    year
+        Four-digit year to download.
+    satellite
+        GOES satellite name, e.g. "goes18".
+    out_dir
+        Root output directory.
+    resume
+        If True, pass `--continue` to `wget`.
+    """
+    year = int(args.year)
+    if year < 2000 or year > 2100:
+        raise ValueError("--year must be a reasonable four-digit year.")
+
+    satellite = str(args.satellite).strip().lower()
+    out_dir = Path(args.out_dir) / f"{year:04d}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    product = "xrsf-l2-flx1s_science"
+    base_url = (
+        f"https://data.ngdc.noaa.gov/platforms/solar-space-observing-satellites/goes/{satellite}/l2/data/{product}/{year:04d}/"
+    )
+
+    cmd = [
+        "wget",
+        "--recursive",
+        "--no-parent",
+        "--no-host-directories",
+        "--cut-dirs=9",
+        "--reject",
+        "index.html*",
+        "--accept",
+        "*.nc",
+        "--directory-prefix",
+        str(out_dir),
+    ]
+
+    if args.resume:
+        cmd.append("--continue")
+
+    cmd.append(base_url)
+
+    print(f"satellite : {satellite}")
+    print(f"year      : {year:04d}")
+    print(f"product   : {product}")
+    print(f"url       : {base_url}")
+    print(f"out_dir   : {out_dir}")
+    print("running   : " + " ".join(cmd))
+
+    try:
+        subprocess.run(cmd, check=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError("wget was not found on this system. Please install wget and try again.") from exc
+
+    print("GOES XRS download complete.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="specscout",
@@ -547,6 +614,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     roi.set_defaults(func=roi_search_cmd)
+
+    # goes-xrs
+    goes = subparsers.add_parser(
+        "goes-xrs",
+        help="Download GOES 1 s soft X-ray lightcurves (NetCDF files) for a given year.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    goes.add_argument(
+        "--year",
+        type=int,
+        required=True,
+        help="Four-digit year to download.",
+    )
+    goes.add_argument(
+        "--satellite",
+        type=str,
+        default="goes18",
+        help='GOES satellite name, e.g. "goes18".',
+    )
+    goes.add_argument(
+        "--out-dir",
+        type=Path,
+        required=True,
+        help="Root output directory. Files will be placed under out-dir/YEAR/...",
+    )
+    goes.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume partially downloaded files using wget --continue.",
+    )
+    goes.set_defaults(func=goes_xrs_cmd)
 
     return parser
 
